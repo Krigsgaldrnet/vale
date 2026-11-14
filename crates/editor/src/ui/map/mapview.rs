@@ -163,9 +163,9 @@ const LOCK_FROM: f32 = 20.0;
 ///
 /// The Select and Measure buttons over the viewport and the tool bars beside
 /// them are areas of the same order as windows, and egui puts an area that
-/// appears for the first time above the others. Opened before the viewport
-/// has a size, as `--tiles` opens it, the window was then drawn under those
-/// buttons, which covered Create and Delete. Three frames covers the frame
+/// appears for the first time above the others. A window opened before the
+/// viewport has a size, as `--tiles` opens it, is drawn under those buttons,
+/// which then cover Create and Delete. Three frames covers the frame
 /// the viewport gets its size; after that, a press decides which is on top,
 /// as for every other window.
 const RAISE_FRAMES: u8 = 3;
@@ -356,7 +356,7 @@ pub(crate) enum Asked {
     Rebake,
     /// Redraw the selection's minimap pictures.
     Minimap,
-    /// …and every tile of the map's.
+    /// Redraw the minimap pictures of every tile the map has.
     MinimapsAll,
     /// Regenerate the server's files for the selection: `maps`, `vmaps`,
     /// `mmaps`.
@@ -364,7 +364,7 @@ pub(crate) enum Asked {
     /// Ask where to save the selection's height map, and write it. See
     /// `crate::import::images`.
     ExportHeights,
-    /// …or its blend map.
+    /// Ask where to save the selection's blend map, and write it.
     ExportBlends,
     /// Ask for a picture to import, and show what importing it would do.
     ChooseImport,
@@ -1220,9 +1220,8 @@ fn side_panel(
     }
     ui.checkbox(&mut tiles.cast_from_ground, "Include terrain shadow").on_hover_text(
         "Also bakes shadow cast by the terrain onto itself. Off by default, because the shipped \
-         bakes do not appear to include it: against two shipped tiles, hull-cast shadow matches \
-         their MCSH at 1.2-1.4x the base rate and terrain-cast shadow at 0.4-0.9x, which is \
-         chance or worse.",
+         shadow maps do not include it: on the tiles measured, adding it lowers the share of \
+         texels that agree with the shipped map.",
     );
 
     theme::heading(ui, "Minimaps");
@@ -1433,7 +1432,7 @@ fn claims_section(ui: &mut egui::Ui, view: &mut MapView, session: &EditSession) 
             counts.push(format!("{} with unsubmitted edits", holder.edited));
         }
         // The name on one line, cut to the panel, and the counts under it,
-        // wrapped: a name and its counts on one line ran past the panel.
+        // wrapped: a name and its counts on one line run past the panel.
         let row = ui
             .vertical(|ui| {
                 ui.horizontal(|ui| {
@@ -1839,7 +1838,8 @@ fn screen_picker(
         .max_height(300.0)
         .show(ui, |ui| {
             // A grid of a fixed width: wrapped rows in a modal that sizes to
-            // its contents never wrap, and the form grew across the window.
+            // its contents never wrap, so the form would grow across the
+            // window.
             egui::Grid::new("map-new-screen-grid").num_columns(COLUMNS).spacing([6.0, 6.0]).show(ui, |ui| {
                 let open = open_screen.and_then(|id| screens.screen(id)).map(|(_, path)| path);
                 let entries = std::iter::once((None, "the open map's", open))
@@ -2026,8 +2026,7 @@ fn paint_cell(
     marks: Marks,
 ) {
     if session.wdt_claims(at) {
-        // The tile's minimap picture, which is what makes this a map rather
-        // than a checkerboard.
+        // The tile's minimap picture, when the minimap index names one.
         match minimaps.texture(&session.map, at.0, at.1) {
             Some(path) => {
                 thumbnails.want(&path);

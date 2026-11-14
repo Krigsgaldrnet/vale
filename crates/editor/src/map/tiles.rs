@@ -23,7 +23,7 @@
 //! and neither a shadow nor a roof stops at the tile seam, so a bake or a
 //! picture made from one tile's own placements is wrong along every edge a
 //! building crosses. See [`neighbours_of`]; the rule is
-//! `collision::hulls_near`'s and `minimap::render`'s.
+//! `collision::shadow_casters_near`'s and `minimap::render`'s.
 //!
 //! The shadow and the minimap are derived from the tile rather than part of
 //! it, so an edit leaves them stale without changing what the viewport shows.
@@ -32,7 +32,7 @@
 //!
 //! ## Why the shadow and the minimap are buttons
 //!
-//! A rebake is a million rays and takes about a minute on one tile; a minimap
+//! A rebake is a million rays and takes a few seconds on one tile; a minimap
 //! is a million texels and takes a second or two. Neither can run during a
 //! brush stroke, so neither runs automatically. They are buttons, and the
 //! panel states what each costs before it is pressed.
@@ -58,12 +58,11 @@ pub(crate) struct Tiles {
     /// The `AreaTable` id every chunk of a new tile gets. Zero is no area,
     /// which is what an unassigned chunk of a shipped tile reads.
     pub(crate) area: u32,
-    /// Whether a rebake casts from the terrain as well as from the hulls.
+    /// Whether a rebake casts from the terrain as well as from the doodads and
+    /// buildings.
     ///
-    /// Off by default, because the shipped bakes do not appear to include it.
-    /// The measurement is at `vale_edit::shadow::Ground`: hull-cast shadow
-    /// lands at 1.2–1.4x the base rate of shadow in a shipped file and
-    /// terrain-cast shadow at 0.4–0.9x, which is no better than chance.
+    /// Off by default, because the shipped bakes do not include it. The
+    /// measurement is at `vale_edit::shadow::Ground`.
     pub(crate) cast_from_ground: bool,
     /// Whether an imported height map carries what stands on the ground it
     /// moves. See `crate::import::images`.
@@ -113,7 +112,7 @@ pub(crate) enum Derived {
     Shadows,
     /// The selection's minimaps.
     Minimap,
-    /// Every tile of the map's.
+    /// The minimaps of every tile the map has.
     MinimapsAll,
 }
 
@@ -189,9 +188,10 @@ pub(crate) fn create(
 /// A tile of the archives has its `MAIN` bit cleared, and its ADT, if the
 /// project has one, is left in the project. A tile the archives do not have
 /// is one the project created ([`create`]), and is deleted with [`delete`]:
-/// its ADT file, its minimap picture and its claim. Left in the project, its
-/// file kept the tile listed in Project Files and drawn as the project's in
-/// the map window, and Create writes flat ground over it in any case.
+/// its ADT file, its minimap picture and its claim. Its file is not left in
+/// the project, because a file left there keeps the tile listed in Project
+/// Files and drawn as the project's in the map window, and Create writes flat
+/// ground over it in any case.
 pub(crate) fn remove(
     session: &mut EditSession,
     assets: &GameAssets,
@@ -291,16 +291,13 @@ fn minimap_of(session: &EditSession, assets: &GameAssets, key: &vale_edit::TileK
 
 /// Start a rebake of one tile's `MCSH`, on the task pool.
 ///
-/// A rebake takes about a minute: 256 chunks of 4,096 texels, each a ray
-/// against every hull whose box it crosses. There is no incremental form, and
-/// one would be hard to write: moving one tree changes the shadow of
-/// everything the sun's ray passes on the way to it.
+/// Reading the models and textures that cast needs the archives and the main
+/// thread, so it is done here; the rays are cast on the task pool by
+/// [`crate::jobs`], and [`collect_bakes`] puts the result back. What casts,
+/// and why, is described at `vale_edit::shadow`.
 ///
-/// It therefore does not run on the frame, where a minute would make the
-/// window stop responding. This function gathers everything the bake needs,
-/// the tile's own bytes and the hulls standing on it, both of which need the
-/// archives and the main thread, and hands them to [`crate::jobs`].
-/// [`collect_bakes`] puts the result back.
+/// There is no incremental rebake: moving one tree changes the shadow of
+/// everything a ray to the sun passes on the way to it.
 ///
 /// The tile is cloned into the job rather than borrowed, so the rest of the
 /// editor can go on editing it. If it was edited while the bake ran, the
@@ -320,39 +317,39 @@ pub(crate) fn start_rebake(
     // The parsed form, which is what the hull builder reads placements out of.
     let raw = tile.write();
     let adt = vale_assets::world::adt::Adt::parse(&raw).map_err(|e| e.to_string())?;
-    // The eight tiles around it are read too, because a building is placed by
-    // the tile its origin is on and its walls cross the seam. When a rebake
-    // read only this tile's own file, rebaking every tile a harbour stands on
-    // shadowed the tile the harbour belongs to and none of the others.
-    // `casting_box` limits the neighbours' hulls to the ones a ray from this
-    // tile can reach; see `collision::hulls_near`.
+    // The eight tiles around it are read too: a placement is recorded by the
+    // tile its origin stands on, and its shadow can fall across the seam.
+    // `casting_box` keeps the neighbours' placements to the ones a ray from
+    // this tile can reach.
     let neighbours = neighbours_of(session, assets, at);
     let everything: Vec<&vale_assets::world::adt::Adt> =
         std::iter::once(&adt).chain(neighbours.iter()).collect();
     let reader = assets.reader();
-    let hulls = vale_assets::world::collision::hulls_near(
+    let casters = vale_assets::world::collision::shadow_casters_near(
         &everything,
         |path| reader(path),
         Some(shadow::casting_box(at.0, at.1, shadow::REACH)),
+        vale_assets::world::collision::BuildingCasts::Hull,
+        true,
     );
 
     let progress = crate::jobs::Progress::new(shadow::CHUNKS);
-    let sun = vale_assets::tables::light::SUN_TOWARD;
+    let sun = vale_assets::tables::light::SHADOW_SUN;
     let from_ground = tiles.cast_from_ground;
     let watched = progress.clone();
     let mut tile = tile;
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let watch = move |done: usize| watched.set(done);
-        let hulls = Hulls(hulls);
+        let casters = shadow::Casters::new(casters, shadow::ALPHA_TEST);
         let baked = match from_ground {
-            false => shadow::bake_watching(&mut tile, sun, &hulls, shadow::REACH, &watch),
+            false => shadow::bake_watching(&mut tile, sun, &casters, shadow::REACH, &watch),
             true => {
                 let ground = shadow::Ground::of(&tile);
                 shadow::bake_watching(
                     &mut tile,
                     sun,
-                    &shadow::Either(&ground, &hulls),
+                    &shadow::Either(&casters, &ground),
                     shadow::REACH,
                     &watch,
                 )
@@ -430,16 +427,16 @@ pub(crate) fn collect_bakes(
         }
         if baked.changed > 0 {
             // Both calls are needed. A bake written only into `session.tiles`
-            // was not seen downstream: the overlay went on answering with the
-            // old bytes, so the tile on screen kept its old `MCSH` until the
-            // project was saved and the editor restarted.
+            // is not seen downstream: the overlay answers with the old bytes,
+            // so the tile on screen keeps its old `MCSH` until the project is
+            // saved and the editor restarted.
             //
             // `publish` puts the new bytes where the next read finds them and
             // marks the tile unsaved; `stale` asks for that read. `MCSH` is
             // folded into the ground's own vertex shading when a draw group is
             // built, so there is nothing on screen to patch, and reading the
-            // tile again is the only way to show it. Since `terrain::swap`, that
-            // read costs a task and leaves no gap in the world.
+            // tile again is the only way to show it. With `terrain::swap`, that
+            // read runs as a task and leaves no gap in the world.
             session.publish(baked.at);
             session.stale.insert(baked.at);
         }
@@ -796,8 +793,8 @@ fn neighbours(
 }
 
 /// The background work the status line shows: shadow rebakes and minimap
-/// runs. One parameter, since the panel system that draws the line has no
-/// room for two.
+/// runs. They are one system parameter, because the panel system that draws
+/// the line has no parameter slot left for a second.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct Background<'w> {
     shadows: Res<'w, crate::jobs::Running<Baked>>,
@@ -960,18 +957,10 @@ fn building_box(assets: &GameAssets, wdt: &wdt::WdtFile) -> Option<super::buildi
     }
 }
 
-/// A tile's placed hulls, as the occluder a bake tests rays against.
-struct Hulls(Vec<vale_assets::world::collision::Collider>);
-
-impl shadow::Occluder for Hulls {
-    fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
-        self.0.iter().any(|c| c.ray(from, toward, max).is_some())
-    }
-}
-
 /// How long a rebake is expected to take, for the panel to state before the
-/// button is pressed. `vale bake` measured 52–64 seconds a tile.
-pub(crate) const REBAKE_SECONDS: u32 = 60;
+/// button is pressed. `vale bake <Map> <x> <y> shadow` measured 1.4–1.6
+/// seconds a tile, opening the archives included.
+pub(crate) const REBAKE_SECONDS: u32 = 2;
 
 /// Whether this tile has been opened for editing. Both derived operations
 /// require it.
@@ -982,10 +971,10 @@ pub(crate) fn is_open(session: &EditSession, at: (u32, u32)) -> bool {
 /// Do whatever the map window asked for.
 ///
 /// Every tile operation applies to the window's selection rather than to the
-/// pointer. An earlier version acted on the tile under the pointer, and
-/// `Cursor::ground` is `None` over a tile that does not exist, so Create could
-/// never run. See [`crate::ui::map::mapview`]. A new map and making the map a
-/// building act on the map and need no selection.
+/// pointer. `Cursor::ground` is `None` over a tile that does not exist, so an
+/// operation on the tile under the pointer could never run Create. See
+/// [`crate::ui::map::mapview`]. A new map and making the map a building act
+/// on the map and need no selection.
 ///
 /// The work is done here rather than in the window because the window holds
 /// the session shared, every one of these needs it mutably, and most need the
@@ -1404,8 +1393,8 @@ pub(crate) fn run_derive(
 /// ## Why the WDT is loaded once and each source is parsed once
 ///
 /// The usual case is one tile copied onto a selection, and a selection is as
-/// many squares as were dragged over; several hundred is common. Two things
-/// follow, and each was once done per tile inside this function:
+/// many squares as were dragged over; several hundred is common. So two
+/// things are done once per run rather than once per tile:
 ///
 /// * The WDT is loaded, updated and written once for the run. It is one 32 KB
 ///   file for the whole map, read, parsed, bit-set and written back whole.
@@ -1417,8 +1406,8 @@ pub(crate) fn run_derive(
 ///   from [`AdtFile::clone`] of the parsed source.
 ///
 /// A paste runs on the frame that asked for it, so its whole cost is time in
-/// which the window does not respond. The per-tile version made a multi-tile
-/// paste stop the window responding.
+/// which the window does not respond. Done per tile, a multi-tile paste stops
+/// the window responding.
 pub(crate) fn paste_into(
     session: &mut EditSession,
     assets: &GameAssets,
@@ -1505,8 +1494,8 @@ fn paste_one(
 /// around the camera and loads whichever of them read back as an ADT, and it
 /// never reads the WDT: `Wdt::parse` has two callers in this repository and
 /// neither is the streamer. Clearing a tile's `MAIN` bit therefore changes
-/// what a client would ask for and nothing that this viewport already draws,
-/// so a deleted tile's ground stayed on screen.
+/// what a client would ask for and nothing that this viewport already draws.
+/// Without this system, a deleted tile's ground stays on screen.
 ///
 /// The streamer asks for a tile once and remembers the answer either way, so
 /// both directions need this: a tile that did not exist when the camera

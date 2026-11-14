@@ -1,77 +1,77 @@
-//! Standing on a building, and not walking through its walls.
+//! Collision hulls for buildings, doodads and game objects, and the floor and
+//! wall queries the local movement simulation makes against them.
 //!
 //! The server is authoritative and runs its own collision against the vmaps its
-//! extractor built out of these same files, so nothing here changes what the
-//! world believes. What it changes is the local simulation: without it the
-//! character falls through Stormwind to the terrain underneath the city, and
-//! walks into a wall until the server drags them back out.
+//! extractor built from these same files, so nothing here changes the server's
+//! state. This module serves the local simulation. Without it the character
+//! falls through Stormwind to the terrain under the city, and walks into a wall
+//! until the server moves them back.
 //!
-//! ## Which triangles are solid is a per-triangle question, not a per-batch one
+//! ## WMO hulls: solidity is decided per triangle, not per batch
 //!
-//! [`crate::world::wmo::collides`] is the rule, and it reads `MOPY` — a chunk the render path
-//! has no use for and did not parse until this module wanted it. The important
-//! consequence is that the collision hull is not the geometry that is drawn:
+//! [`crate::world::wmo::collides`] is the rule, and it reads `MOPY`, a chunk the
+//! render path does not use. As a result the collision hull is not the drawn
+//! geometry:
 //!
 //! * a WMO carries invisible collision triangles (`MOPY` `COLLISION` with no
 //!   `RENDER` bit), which no batch references and which `WmoModel::assemble`
 //!   therefore never sees;
-//! * it carries drawn triangles that are not solid (`DETAIL` — grass laid over
-//!   a floor, trim laid over a wall), which would double the hull for nothing;
-//! * `assemble` drops batches whose material will not resolve and groups that
-//!   are antiportals, and a hull built from its output would have holes in it
-//!   exactly where a room failed to texture.
+//! * it carries drawn triangles that are not solid (`DETAIL`: grass laid over
+//!   a floor, trim laid over a wall), which would add to the hull without
+//!   blocking anything;
+//! * `assemble` drops batches whose material does not resolve and groups that
+//!   are antiportals, so a hull built from its output would have holes where a
+//!   room failed to texture.
 //!
-//! So [`CollisionMesh::build`] walks the groups again from `MOVT`/`MOVI`/`MOPY`
-//! and ignores the draw list entirely. It is the same pass vmangos'
+//! [`CollisionMesh::build`] therefore walks the groups again from
+//! `MOVT`/`MOVI`/`MOPY` and ignores the draw list. It is the same pass vmangos'
 //! `WMOGroup::ConvertToVMAPGroupWmo` makes over the same three chunks.
 //!
-//! ## An M2 answers the same question with a different block, and no flag
+//! ## M2 hulls: the `BoundingTriangles` block
 //!
-//! A doodad — a tree, a fence, a crate, and the furniture inside a building
-//! — carries its own hull in the `BoundingTriangles` block, which
-//! [`crate::world::m2::M2::collision`] reads and which nothing on the render path
-//! touches. That block has no `MOPY` and no per-triangle flag: it exists for
-//! collision and nothing else, so every triangle in it is solid. A model with
-//! no such block is not a failure — it is how the game says *walk through
-//! me*, which is most of the grass, every bird and every flame, and vmangos'
-//! `Model::open` drops exactly those before they reach a vmap.
+//! A doodad (a tree, a fence, a crate, the furniture inside a building)
+//! carries its own hull in the `BoundingTriangles` block, which
+//! [`crate::world::m2::M2::collision`] reads and the render path does not use.
+//! That block has no `MOPY` and no per-triangle flag. It exists only for
+//! collision, so every triangle in it is solid. A model with no such block is
+//! not an error: it is a model the character walks through, which covers most
+//! grass, every bird and every flame. vmangos' `Model::open` drops the same
+//! models before they reach a vmap.
 //!
-//! ## …and a third population, which no file places at all
+//! ## Game object hulls
 //!
-//! A game object — a door, a portcullis, a chest, a mailbox — is not in any
-//! `MDDF` or `MODF` row. It is spawned by the server, arrives as an entity
-//! with a `GAMEOBJECT_DISPLAYID`, a position and a facing, and can be taken away
-//! again mid-session. Its hull is the same `BoundingTriangles` block a doodad's
-//! is, out of the same M2, but its lifetime is not a tile's — so it is held
-//! apart from the tiles, keyed by GUID, in [`Objects`].
+//! A game object (a door, a portcullis, a chest, a mailbox) is not in any
+//! `MDDF` or `MODF` row. The server spawns it as an entity with a
+//! `GAMEOBJECT_DISPLAYID`, a position and a facing, and can remove it during
+//! the session. Its hull is the `BoundingTriangles` block of its M2, as for a
+//! doodad, but its lifetime is not a tile's, so it is held apart from the
+//! tiles, keyed by GUID, in [`Objects`].
 //!
-//! It differs from a placement in a second way that is the whole point of the
-//! report this exists for: it is solid only in one of its states.
-//! [`game_object_is_solid`] is that rule, and it is vmangos' own — a closed
-//! Deadmines door blocks a stride, and the same door standing open does not.
+//! A game object is also solid in only some of its states.
+//! [`game_object_is_solid`] is that rule, taken from vmangos: a closed
+//! Deadmines door blocks a stride, and the same door open does not.
 //!
-//! Everything below this point is shared: a hull is a hull, and [`Collider`]
-//! neither knows nor cares which file it came out of.
+//! The code after this point is shared by all three sources: [`Collider`] does
+//! not depend on which file a hull came from.
 //!
-//! ## Two questions, and only two
+//! ## Queries
 //!
-//! [`CollisionWorld::floor`] answers what am I standing on, and
-//! [`CollisionWorld::step`] answers where does this stride actually end. Both
-//! are cheap enough for the session thread to ask twenty times a second, which
-//! is the constraint that shapes the rest: a placed building keeps its triangles
-//! in world space in a uniform grid over the XY footprint, so a query touches
-//! one cell rather than Stormwind's quarter-million triangles.
+//! [`CollisionWorld::floor`] returns the surface under the character, and
+//! [`CollisionWorld::step`] returns where a stride ends. The session thread
+//! calls both twenty times a second, which sets the design: a placed building
+//! keeps its triangles in world space in a uniform grid over the XY footprint,
+//! so a query touches one cell rather than Stormwind's quarter-million
+//! triangles.
 //!
-//! ## The heights are the part with judgement in them
+//! ## Step height and wall probe heights
 //!
-//! [`STEP_UP`] and [`PROBE_HEIGHTS`] are not in any file. They are the two
-//! numbers that decide whether stairs work: a stair riser is a vertical wall a
-//! few inches high, so a wall probe at ankle height stops the character dead at
-//! the bottom of every staircase in the game. The probes therefore start
-//! above the height a character can climb, and everything below that is left
-//! to the floor query to lift them over. Getting this wrong does not fail — it
-//! produces a client that cannot enter a building, which is why the numbers are
-//! named and commented rather than inlined.
+//! [`STEP_UP`] and [`PROBE_HEIGHTS`] are not in any file. They decide whether
+//! stairs work: a stair riser is a vertical wall a few inches high, so a wall
+//! probe at ankle height stops the character at the bottom of every staircase.
+//! The probes therefore start above the height a character can climb, and the
+//! floor query lifts the character over everything below that. Wrong values do
+//! not produce an error; they produce a client that cannot enter a building.
+//! The numbers are named constants for that reason.
 
 use crate::world::wmo::WmoGroup;
 use std::collections::{HashMap, HashSet};
@@ -82,17 +82,17 @@ use std::sync::{Arc, RwLock};
 /// This is the client's step height: the character is lifted onto anything
 /// within it without jumping, and anything above it is a ledge they are under
 /// rather than a floor they are on. It is also the ceiling on the floor query,
-/// which is what keeps a character walking under a bridge from being sucked up
-/// onto its deck.
+/// which keeps a character walking under a bridge from being lifted onto its
+/// deck.
 pub const STEP_UP: f32 = 1.0;
 
 /// Heights above the feet at which a stride is tested for walls.
 ///
-/// The lowest is above [`STEP_UP`] on purpose. Every staircase in the game
-/// is a run of vertical risers, and a probe below the step height hits the
-/// first one and stops the character at the bottom of it. What is left below
-/// the lowest probe is walked over and then lifted by the floor query, which is
-/// the same thing the real client does with a kerb.
+/// The lowest is above [`STEP_UP`]. A staircase is a run of vertical risers,
+/// and a probe below the step height hits the first one and stops the
+/// character at the bottom. Geometry below the lowest probe is walked over and
+/// then lifted by the floor query, which is what the 1.12.1 client does with a
+/// kerb.
 pub const PROBE_HEIGHTS: [f32; 2] = [STEP_UP + 0.2, 1.9];
 
 /// How close to a wall the character is allowed to get, in yards.
@@ -103,21 +103,21 @@ pub const PROBE_HEIGHTS: [f32; 2] = [STEP_UP + 0.2, 1.9];
 /// at — see [`PROBE_LANES`].
 pub const PLAYER_RADIUS: f32 = 0.5;
 
-/// Sideways offsets, in yards, of the lines a stride is tested along — see
-/// `wall_ahead`, which is where the argument is.
+/// Sideways offsets, in yards, of the lines a stride is tested along. See
+/// `wall_ahead` for the reasoning.
 ///
-/// The centre and both shoulders. A character is a body rather than a line, and
-/// a single ray up the centre axis stops a stride only when something is dead
-/// ahead of the character's own middle: a post, a trunk, a door jamb taken at
-/// an angle and the corner of anything are all missed by it entirely.
+/// The centre and both shoulders. A single ray along the centre axis stops a
+/// stride only when something is directly ahead of the character's centre: it
+/// misses a post, a trunk, a door jamb approached at an angle, and any corner.
 pub(crate) const PROBE_LANES: [f32; 3] = [0.0, -PLAYER_RADIUS, PLAYER_RADIUS];
 
 /// How many times one stride may have a wall's own direction taken out of it
 /// before the answer is to stand still.
 ///
-/// Two walls is a doorway and is walked through; three is a corner, and there
-/// is nowhere left for the stride to go. See [`CollisionWorld::step`], which
-/// used to run out of attempts and then apply whatever motion was left.
+/// Two walls is a doorway and is walked through; three is a corner, and no
+/// direction is left for the stride. When the attempts run out,
+/// [`CollisionWorld::step`] stands still rather than applying the remaining
+/// motion.
 const CANCELS: usize = 3;
 
 /// A triangle whose normal is this far from vertical is a wall, and blocks;
@@ -151,21 +151,21 @@ pub struct CollisionMesh {
     /// render buffers, because the hull keeps a different subset of them.
     pub indices: Vec<u32>,
     /// How many triangles the groups declared in total, solid or not. Kept only
-    /// so `vale collision` can report the ratio — a hull that is 100% of the
+    /// so `vale collision` can report the ratio. A hull that is 100% of the
     /// geometry means the `DETAIL` term was dropped, and a hull that is 0% means
-    /// `MOPY` was not read at all, and both look fine from every other angle.
+    /// `MOPY` was not read. Neither fault shows up anywhere else.
     pub declared_triangles: usize,
     /// Which `MOGP` group each solid triangle came from, as an index into
     /// [`Self::group_flags`] — one entry per triangle, or empty for a hull that
     /// has no groups (an M2's `BoundingTriangles`, and the tests' invented ones).
     ///
-    /// Kept for one question: which group's floor a character is standing on,
-    /// which is what decides whether they are outdoors. See
-    /// [`Collider::building_floor`], and [`crate::world::wmo::group_flags::OUTDOOR`]
-    /// for the bit that is read off the answer.
+    /// Used to find which group's floor a character is standing on, which
+    /// decides whether they are outdoors. See [`Collider::building_floor`], and
+    /// [`crate::world::wmo::group_flags::OUTDOOR`] for the bit read from that
+    /// group.
     pub triangle_groups: Vec<u16>,
-    /// …and each of those groups' `MOGP` flag word, in the order
-    /// [`Self::build`] walked them.
+    /// The `MOGP` flag word of each group in [`Self::triangle_groups`], in the
+    /// order [`Self::build`] walked them.
     pub group_flags: Vec<u32>,
 }
 
@@ -205,8 +205,8 @@ impl CollisionMesh {
                 ];
                 // A triangle indexing past `MOVT` is a damaged tail. Checked
                 // before any corner is pushed, because emitting one or two of
-                // three would shift every triangle after it — the hull would
-                // still be a hull, just not this building's.
+                // three would shift every later triangle and produce a hull
+                // that does not match the building.
                 if corners.iter().any(|&c| c as usize >= group.positions.len()) {
                     continue;
                 }
@@ -241,8 +241,8 @@ impl CollisionMesh {
 ///
 /// World space rather than model space with an inverse transform per query,
 /// because a placement is built once and queried for as long as its tile is
-/// loaded — and the inverse of a matrix with a 180° term in it is one more
-/// place for the axes to go wrong silently.
+/// loaded, and inverting a matrix with a 180° term in it is another place
+/// where an axis error would go unnoticed.
 #[derive(Debug)]
 pub struct Collider {
     positions: Vec<[f32; 3]>,
@@ -412,10 +412,10 @@ impl Collider {
 
     /// The three world-space corners of one solid triangle.
     ///
-    /// Public so a check can walk the hull it built — `vale collision` takes
-    /// triangle centroids back through [`Self::floor`] and [`CollisionWorld::step`],
-    /// which is the only way to test the grid against real buildings rather
-    /// than against invented ones.
+    /// Public so a check can walk the hull it built: `vale collision` passes
+    /// triangle centroids back through [`Self::floor`] and
+    /// [`CollisionWorld::step`], which tests the grid against shipped buildings
+    /// rather than invented ones.
     pub fn triangle(&self, triangle: usize) -> [[f32; 3]; 3] {
         let i = triangle * 3;
         [
@@ -460,21 +460,20 @@ impl Collider {
     /// The highest solid surface under `(x, y)` that is at or below `ceiling`,
     /// or `None` where the hull has nothing over that point.
     ///
-    /// `ceiling` is what stops the query from answering with the roof while the
-    /// character is standing on the ground floor; the caller sets it to the
-    /// feet plus [`STEP_UP`].
+    /// `ceiling` stops the query from returning the roof while the character
+    /// stands on the ground floor; the caller sets it to the feet plus
+    /// [`STEP_UP`].
     pub fn floor(&self, x: f32, y: f32, ceiling: f32) -> Option<f32> {
         self.surface(x, y, ceiling).map(|(z, _)| z)
     }
 
-    /// …and that surface with the slope it lies at, as a unit normal
-    /// oriented upwards.
+    /// The surface [`Self::floor`] returns, with its slope as an upward unit
+    /// normal.
     ///
-    /// The winning triangle's own normal — the same triangle [`Self::floor`]
-    /// took the height off, which is the whole reason this is one function with
-    /// two readers rather than two lookups: a model tilted by one triangle
-    /// while standing at another's height leans the wrong way on every step of
-    /// a staircase.
+    /// The normal is that of the triangle [`Self::floor`] took the height from.
+    /// This is one function with two callers rather than two lookups because a
+    /// model tilted by one triangle while standing at another's height leans
+    /// the wrong way on every step of a staircase.
     pub fn surface(&self, x: f32, y: f32, ceiling: f32) -> Option<(f32, [f32; 3])> {
         if x < self.bounds[0][0]
             || x > self.bounds[1][0]
@@ -497,10 +496,9 @@ impl Collider {
             }
         }
         best.map(|(z, triangle)| {
-            // `normal_of` answers zero for a degenerate triangle and follows the
-            // file's own winding otherwise, which a `BoundingTriangles` hull
-            // does not guarantee faces the sky. Both cases answer straight up
-            // here rather than upside down.
+            // `normal_of` returns zero for a degenerate triangle and otherwise
+            // follows the file's winding, which in a `BoundingTriangles` hull
+            // does not always face up. Both cases return an upward normal here.
             let n = self.triangle_normal(triangle);
             let n = match n[2] {
                 _ if n == [0.0; 3] => [0.0, 0.0, 1.0],
@@ -512,16 +510,16 @@ impl Collider {
     }
 
     /// The highest floor under `(x, y)` at or below `ceiling`, and the `MOGP`
-    /// flag word of the group it belongs to — `None` where the hull has
-    /// nothing there, or has no groups at all (an M2).
+    /// flag word of the group it belongs to. `None` where the hull has nothing
+    /// there, or has no groups (an M2).
     ///
     /// This is vmangos' `VMapManager2::getAreaInfo`: a ray straight down from
-    /// the probe, and the group of the first triangle it meets. The server asks
-    /// it to decide `IsOutdoors`, and the reference client answers the same
-    /// question from the WMO group its scene graph has linked the unit into,
-    /// which is a BSP containment this client does not have. The
-    /// floor under the feet belongs to the room the feet are in for every
-    /// building measured, which is why the server can use it.
+    /// the probe, and the group of the first triangle it meets. The server uses
+    /// it to decide `IsOutdoors`. The 1.12.1 client decides the same question
+    /// by which WMO group contains the unit, a containment test this client
+    /// does not have. In every building measured, the floor under the feet
+    /// belongs to the room the feet are in, which is why the server's method
+    /// works.
     pub fn building_floor(&self, x: f32, y: f32, ceiling: f32) -> Option<(f32, u32)> {
         if self.triangle_groups.is_empty()
             || x < self.bounds[0][0]
@@ -550,12 +548,11 @@ impl Collider {
 
     /// The nearest surface of any slope a ray meets, as a distance.
     ///
-    /// [`Self::wall`] answers the mover's question — "what would stop a stride?"
-    /// — and deliberately skips floors, since a probe from inside a room meets
-    /// the floor it is standing on every time. The camera asks the other
-    /// question: anything between the character and the eye is something to
-    /// pull in past, floors and ceilings very much included, because the
-    /// commonest thing a third-person camera ends up inside is a roof.
+    /// [`Self::wall`] serves the mover, which needs what would stop a stride,
+    /// and skips floors, because a probe from inside a room always meets the
+    /// floor it stands on. The camera needs every surface between the
+    /// character and the eye, floors and ceilings included, because the most
+    /// common surface a third-person camera ends up behind is a roof.
     pub fn ray(&self, origin: [f32; 3], dir: [f32; 3], max: f32) -> Option<f32> {
         let end = [
             origin[0] + dir[0] * max,
@@ -598,29 +595,27 @@ impl Collider {
 
     /// The nearest wall a ray meets, as `(distance, outward normal)`.
     ///
-    /// "Outward" meaning facing the ray: a WMO's winding says which side of a
-    /// wall is outside, and a wall met from inside a room would otherwise push
-    /// the character further in. Only walls are reported — a floor underfoot is
-    /// hit by every probe and is the floor query's business.
+    /// "Outward" means facing the ray. A WMO's winding says which side of a
+    /// wall is outside, and without this a wall met from inside a room would
+    /// push the character further in. Only walls are reported: every probe hits
+    /// the floor underfoot, and floors belong to the floor query.
     fn wall(&self, origin: [f32; 3], dir: [f32; 3], max: f32) -> Option<(f32, [f32; 3])> {
         if origin[2] + dir[2] * max < self.bounds[0][2]
             || origin[2].min(origin[2] + dir[2] * max) > self.bounds[1][2]
         {
             return None;
         }
-        // The ray is one stride long, so its cells are a handful; taking them
-        // from its bounding box rather than walking it is both simpler and,
-        // at this length, no more work.
+        // The ray is one stride long and covers a few cells, so taking them
+        // from its bounding box rather than walking it is simpler and, at this
+        // length, no more work.
         let end = [origin[0] + dir[0] * max, origin[1] + dir[1] * max];
 
-        // And the same rejection in XY, which the z test alone does not
-        // give. [`Self::cell_of`] clamps, so a ray a hundred yards away
-        // resolves to the nearest corner cell and every triangle in it is
-        // ray-tested for nothing. That cost nothing while the world held forty
-        // buildings; with a doodad hull per tree it is thousands of hulls
-        // ray-testing themselves twenty times a second, which is the whole
-        // frame. [`Self::floor`] has always rejected this way — this is only
-        // the same test on the query that did not.
+        // The same rejection in XY, which the z test does not give.
+        // [`Self::cell_of`] clamps, so a ray a hundred yards away resolves to
+        // the nearest corner cell and every triangle in it is ray-tested for
+        // nothing. With a doodad hull per tree that is thousands of hulls
+        // tested twenty times a second, which takes the whole frame.
+        // [`Self::floor`] rejects the same way.
         if origin[0].min(end[0]) > self.bounds[1][0]
             || origin[0].max(end[0]) < self.bounds[0][0]
             || origin[1].min(end[1]) > self.bounds[1][1]
@@ -680,12 +675,12 @@ fn grid_axis(extent: f32) -> usize {
 /// The colliders the client currently holds, grouped by the tile that owns
 /// them.
 ///
-/// Keyed by tile because that is the lifetime a building actually has: the
-/// renderer loads a 3x3 around the character and despawns what falls outside
-/// it, and a collider left behind for a building nobody can see is a wall in
-/// the middle of an empty field. Internally locked, as [`crate::Terrain`] is
-/// and for the same reason — the writer is the renderer's main thread and the
-/// reader is the session thread, twenty times a second.
+/// Keyed by tile because a building lives as long as its tile: the renderer
+/// loads a 3x3 around the character and despawns what falls outside it, and a
+/// collider left behind for a despawned building is an invisible wall.
+/// Internally locked, as [`crate::Terrain`] is and for the same reason: the
+/// writer is the renderer's main thread and the reader is the session thread,
+/// twenty times a second.
 #[derive(Default)]
 pub struct CollisionWorld {
     inner: RwLock<Inner>,
@@ -704,21 +699,20 @@ impl Retired {
 #[derive(Default)]
 struct Inner {
     /// Which map these colliders belong to. A far teleport invalidates every
-    /// one of them, and tile coordinates repeat across continents — so this is
-    /// checked on both the read and the write path rather than trusted to the
+    /// one of them, and tile coordinates repeat across continents, so this is
+    /// checked on both the read and the write path rather than left to the
     /// renderer's despawn.
     map_id: Option<u32>,
     tiles: HashMap<(u32, u32), Tile>,
-    /// …and the hulls no tile owns — see [`Objects`].
+    /// The hulls no tile owns. See [`Objects`].
     objects: Objects,
 }
 
 impl Inner {
     /// Every hull the caller's own box test admits, from both populations.
     ///
-    /// The one place the two are joined, so a query cannot be written against
-    /// the tiles and silently miss the game objects — which is exactly the shape
-    /// of bug this whole module is about, and there are five callers.
+    /// The only place the two are joined, so none of the five queries can be
+    /// written against the tiles alone and miss the game objects.
     fn candidates<'a>(
         &'a self,
         keep: impl Fn(&[[f32; 3]; 2]) -> bool + Copy + 'a,
@@ -726,10 +720,10 @@ impl Inner {
         self.candidates_of(keep, Surfaces::ALL)
     }
 
-    /// …and the same walk narrowed to some of the populations — see
-    /// [`Surfaces`]. Separate from [`Self::candidates`] rather than a parameter
-    /// on it because every query but one wants all three, and those five are
-    /// the mover's and the camera's.
+    /// The walk of [`Self::candidates`], narrowed to some of the populations.
+    /// See [`Surfaces`]. Separate from [`Self::candidates`] rather than a
+    /// parameter on it because every query but one wants all three, and those
+    /// five are the mover's and the camera's.
     fn candidates_of<'a>(
         &'a self,
         keep: impl Fn(&[[f32; 3]; 2]) -> bool + Copy + 'a,
@@ -752,58 +746,57 @@ impl Inner {
 struct Tile {
     /// The ids held, each with its index into the three vectors below, so a
     /// second insert of the same thing is recognised in O(1) and replaces the
-    /// hull rather than being ignored. This was a scan over the vector, which
-    /// was free for the dozen buildings on a tile and quadratic for its twelve
-    /// hundred doodads.
+    /// hull rather than being ignored. A scan over the vector would be cheap
+    /// for the dozen buildings on a tile and quadratic for its twelve hundred
+    /// doodads.
     ids: HashMap<SolidId, usize>,
     solids: Vec<Arc<Collider>>,
-    /// Each hull's own world-space box, in `solids` order — the same number
-    /// `Collider::bounds` returns, copied out to where the scan can reach it.
+    /// Each hull's world-space box, in `solids` order: the value
+    /// `Collider::bounds` returns, copied into a contiguous vector for the
+    /// scan.
     ///
-    /// Every query here begins by rejecting a hull on its box, and until this
-    /// existed that first test dereferenced the `Arc` to read it: a pointer
-    /// chase into a separately allocated `Collider` per hull per query, which
-    /// is a cache miss apiece and is the whole cost of a query that rejects
-    /// everything. This makes the rejection a linear walk of 24 contiguous
-    /// bytes per hull and leaves the `Arc` untouched until a hull is actually a
-    /// candidate.
+    /// Every query begins by rejecting hulls on their boxes. Reading the box
+    /// through the `Arc` costs a pointer chase into a separately allocated
+    /// `Collider` per hull per query, a cache miss each, and that is the whole
+    /// cost of a query that rejects everything. With this vector the rejection
+    /// is a linear walk of 24 contiguous bytes per hull, and the `Arc` is read
+    /// only for a candidate.
     ///
-    /// The population is what makes it worth a second vector: a tile is a dozen
+    /// The hull count justifies the second vector: a tile holds a dozen
     /// buildings and up to 3,817 solid doodads once a city's furniture is
-    /// counted, the camera asks a ray of all of them every frame, and the
-    /// mover asks a floor and three probe heights of them twenty times a
+    /// counted, the camera casts a ray against all of them every frame, and the
+    /// mover tests a floor and three probe heights against them twenty times a
     /// second. Kept in lockstep with `solids` by [`CollisionWorld::insert`],
-    /// which is the only thing that writes either.
+    /// the only writer of either.
     boxes: Vec<[[f32; 3]; 2]>,
     /// Which population each hull came out of, in `solids` order and kept in
     /// lockstep with it by the same line that writes the box.
     ///
-    /// A second byte per hull rather than a second map, for [`Self::boxes`]'
-    /// reason: the one caller that reads it is filtering thousands of hulls and
-    /// wants the answer beside the box it has just tested. See [`Surfaces`].
+    /// A byte per hull rather than a map, for the reason given on
+    /// [`Self::boxes`]: the one caller that reads it filters thousands of hulls
+    /// and reads the value beside the box it has just tested. See [`Surfaces`].
     kinds: Vec<Solid>,
     /// The indices into `solids` of the [`Solid::Building`] hulls, ascending.
     ///
     /// [`CollisionWorld::building_floor`] is answered only by a hull with
     /// groups, which on a tile is a `MODF` building, and it is asked for every
-    /// unit in the world every frame. Walking `boxes` for it rejected a city
+    /// unit in the world every frame. Walking `boxes` for it rejects a city
     /// tile's thousands of doodads per unit to find its dozen buildings: 4.5 ms
-    /// a frame for 290 units in a debug build. Written by the same two places as
-    /// `kinds`.
+    /// a frame for 290 units in a debug build. Written by the same two places
+    /// as `kinds`.
     buildings: Vec<usize>,
     /// Which `MODF` placements the caller has finished deciding about, by
-    /// `unique_id` — hull placed, hull absent, or the file refused.
+    /// `unique_id`: hull placed, hull absent, or the file refused.
     ///
-    /// This is not the same set as [`Self::ids`] and cannot be derived from it,
-    /// which is the whole reason it exists: a building with no
-    /// `BoundingTriangles` at all inserts no hull, so "is it in `ids`" answers
-    /// no for ever and a caller waiting on it waits for ever. A placement
-    /// that has been looked at and turned out to have nothing solid in it is a
-    /// finished answer, and this is where that is said.
+    /// This is not the same set as [`Self::ids`] and cannot be derived from
+    /// it. A building with no `BoundingTriangles` inserts no hull, so it is
+    /// never in `ids`, and a caller waiting for it to appear there would wait
+    /// for ever. A placement that was examined and has nothing solid in it is
+    /// recorded here as finished.
     ///
-    /// Keyed by placement rather than by [`SolidId`] because the question it
-    /// answers is about the `MODF` row — see
-    /// [`crate::world::adt::Adt::awaiting_building`], the one reader.
+    /// Keyed by placement rather than by [`SolidId`] because it describes the
+    /// `MODF` row. See [`crate::world::adt::Adt::awaiting_building`], the one
+    /// reader.
     settled: HashSet<u32>,
 }
 
@@ -882,10 +875,10 @@ impl Tile {
 
 /// Which population a hull came out of.
 ///
-/// Every query in this module but one ignores it: a hull is a hull to a mover,
-/// and a character standing on a crate is standing on something whether or not
-/// the crate is a doodad. The one that does not is a caller choosing a surface
-/// to put something on, which has to be able to decline a population — see
+/// Every query in this module but one ignores it: the mover treats all hulls
+/// alike, and a character standing on a crate stands on it whether or not the
+/// crate is a doodad. The exception is a caller choosing a surface to put
+/// something on, which must be able to exclude a population. See
 /// [`Surfaces`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Solid {
@@ -893,21 +886,20 @@ pub enum Solid {
     Building,
     /// A `MDDF` doodad, or a building's own `MODD` furniture.
     ///
-    /// One kind and not two, because they are one population everywhere else:
-    /// the same pass draws both, the same switch hides both, and the file a
-    /// piece of furniture comes out of is the same M2 a tree does.
+    /// One variant and not two, because they are one population everywhere
+    /// else: the same pass draws both, the same switch hides both, and a piece
+    /// of furniture comes from an M2 just as a tree does.
     Doodad,
-    /// A game object the server spawned — a door, a chest, an elevator.
+    /// A game object the server spawned: a door, a chest, an elevator.
     Object,
 }
 
 /// Which populations a query will accept an answer from.
 ///
-/// [`Surfaces::ALL`] is what every query here used to take and what all but one
-/// still does. The exception is a caller placing something in the world, where
-/// the populations it is willing to stand a thing on are the ones it is
-/// drawing: standing something on the roof of a building that is switched off
-/// puts it somewhere whoever asked for it cannot look at.
+/// Every query but one takes [`Surfaces::ALL`]. The exception is a caller
+/// placing something in the world, which stands it only on the populations it
+/// is drawing: standing something on the roof of a hidden building puts it
+/// where the user cannot see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Surfaces {
     pub buildings: bool,
@@ -923,7 +915,7 @@ impl Surfaces {
         objects: true,
     };
 
-    /// None of them — the ground and nothing else.
+    /// No population: the ground only.
     pub const NONE: Surfaces = Surfaces {
         buildings: false,
         doodads: false,
@@ -939,8 +931,8 @@ impl Surfaces {
         }
     }
 
-    /// Would this admit anything at all? A query that would not is a walk of
-    /// every hull in the world to reject every one of them.
+    /// Whether this admits no population. A query with such a filter would
+    /// walk every hull in the world and reject all of them.
     pub fn nothing(&self) -> bool {
         *self == Surfaces::NONE
     }
@@ -958,16 +950,15 @@ fn segment_meets(bounds: &[[f32; 3]; 2], from: [f32; 3], to: [f32; 3]) -> bool {
 
 /// What one collider is, so the same thing inserted twice is held once.
 ///
-/// Not a bare `u32`. A `MODD` spawn — the furniture standing inside a
-/// building — has no id of its own and carries its building's, so Stormwind's
-/// three thousand chairs all answer with one number, and a dedup on that number
-/// keeps one chair and silently drops the rest. Two spawns therefore need
-/// something besides the placement id to tell them apart.
+/// Not a bare `u32`. A `MODD` spawn (furniture inside a building) has no id of
+/// its own and carries its building's, so Stormwind's three thousand chairs
+/// share one number, and a dedup on that number keeps one chair and drops the
+/// rest. Two spawns therefore need a second field to tell them apart.
 ///
-/// This is vmangos' own key for the same problem, and it is worth saying that it
-/// is: its extractor names every placed object `GenerateUniqueObjectId(clientId,
-/// clientDoodadId)`, where the doodad id is `0` for anything an `MDDF` or `MODF`
-/// row placed directly and the spawn's ordinal within its building otherwise.
+/// vmangos uses the same key: its extractor names every placed object
+/// `GenerateUniqueObjectId(clientId, clientDoodadId)`, where the doodad id is
+/// `0` for anything an `MDDF` or `MODF` row placed directly and the spawn's
+/// ordinal within its building otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SolidId {
     /// The `MDDF` or `MODF` unique id of the placement this came from.
@@ -977,18 +968,19 @@ pub struct SolidId {
 }
 
 // ---------------------------------------------------------------------------
-// …and the ones the server places
+// Game objects the server places
 // ---------------------------------------------------------------------------
 
-/// `GO_STATE_READY` (`GameObjectDefines.h`) — the reset state: a door shut, a
+/// `GO_STATE_READY` (`GameObjectDefines.h`), the reset state: a door shut, a
 /// portcullis down, a chest with its lid on.
 pub const GO_STATE_READY: u8 = 1;
 
-/// Is this game object one you can walk through?
+/// Whether a game object in this state blocks movement.
 ///
-/// `GO_STATE_ACTIVE` (0) is the used state — a door standing open — and
-/// `GO_STATE_ACTIVE_ALTERNATIVE` (2) is a second one; only `GO_STATE_READY` is
-/// solid. That is vmangos' own test, in `GameObject::UpdateCollisionState`:
+/// `GO_STATE_ACTIVE` (0) is the used state, a door standing open, and
+/// `GO_STATE_ACTIVE_ALTERNATIVE` (2) is a second used state; only
+/// `GO_STATE_READY` is solid. vmangos makes the same test in
+/// `GameObject::UpdateCollisionState`:
 ///
 /// ```text
 /// bool enabled = GetGoType() == GAMEOBJECT_TYPE_CHEST
@@ -996,37 +988,37 @@ pub const GO_STATE_READY: u8 = 1;
 /// m_model->enable(enabled);
 /// ```
 ///
-/// `None` is a real answer and it is open. `Object::_SetCreateBits` omits
-/// a field whose value is zero, so a game object that says nothing about its
-/// state has state 0 — which is `GO_STATE_ACTIVE`. See
-/// `vale_protocol::state::objects::Entity::game_object_state`, whose `None` this is.
+/// `None` means open. vmangos' `Object::_SetCreateBits` omits a field whose
+/// value is zero, so a game object that sends no state has state 0, which is
+/// `GO_STATE_ACTIVE`. See
+/// `vale_protocol::state::objects::Entity::game_object_state`, which returns
+/// this `None`.
 ///
-/// One stated approximation: the chest arm above reads a loot state that
-/// is not on the wire at all, so a chest is judged by its go state like
-/// everything else. The difference is a looted chest that has not changed state,
-/// which stays solid here and does in the reference too — a chest is a box you
-/// bump into either way.
+/// One approximation: the chest arm above reads a loot state that is not sent
+/// to the client, so a chest is judged by its go state like any other game
+/// object. The difference is a looted chest that has not changed state, which
+/// stays solid here, as it does in the 1.12.1 client.
 pub fn game_object_is_solid(state: Option<u8>) -> bool {
     state == Some(GO_STATE_READY)
 }
 
 /// The model-to-world matrix for something the server placed, column-major.
 ///
-/// `position` is world-space and `facing` is the server's own orientation —
-/// radians counter-clockwise about +Z, zero pointing north — which is the pair
-/// every entity in this client is drawn from. So this is `T · Rz(facing) · S`
-/// and nothing else, and in particular it carries no 180° term: that
-/// belongs to [`adt::placement_matrix`], where it is the internal-to-world frame
-/// flip an `MDDF` row's own encoding needs, and a server-placed object's
-/// position and facing never went through that frame.
+/// `position` is world-space and `facing` is the server's orientation, in
+/// radians counter-clockwise about +Z with zero pointing north. Every entity
+/// in this client is drawn from that pair. The matrix is `T · Rz(facing) · S`
+/// with no other term, and in particular no 180° term: that belongs to
+/// [`adt::placement_matrix`], where it is the internal-to-world frame flip an
+/// `MDDF` row's encoding needs, and a server-placed object's position and
+/// facing are not in that frame.
 ///
-/// vmangos builds the same matrix for its dynamic tree —
+/// vmangos builds the same matrix for its dynamic tree in
+/// `GameObjectModel::initialize`:
 /// `G3D::Matrix3::fromEulerAnglesZYX(pGo->GetOrientation(), 0, 0)` about
 /// `Vector3(GetPositionX(), GetPositionY(), GetPositionZ())`, scaled by
-/// `GetObjectScale()` (`GameObjectModel::initialize`) — so a rotation about Z
-/// and nothing else is the server's reading too, and the four-float
-/// `GAMEOBJECT_ROTATION` quaternion beside the facing is not what either of us
-/// collides against.
+/// `GetObjectScale()`. The server also rotates about Z only, and neither it
+/// nor this client collides against the four-float `GAMEOBJECT_ROTATION`
+/// quaternion sent beside the facing.
 ///
 /// [`adt::placement_matrix`]: crate::world::adt::placement_matrix
 pub fn object_matrix(position: [f32; 3], facing: f32, scale: f32) -> [f32; 16] {
@@ -1045,14 +1037,14 @@ pub fn object_matrix(position: [f32; 3], facing: f32, scale: f32) -> [f32; 16] {
     out
 }
 
-/// Where one game object's hull was built for.
+/// The placement one game object's hull was built for.
 ///
-/// Held beside the hull so a caller can ask whether the one it is holding is
-/// still the right one, rather than re-placing every door in view every frame:
-/// `Collider::place` walks and re-indexes every triangle, and a portcullis is
-/// not a cheap one. Compared exactly, the way `place_entities` compares a
-/// `Transform` — a game object that genuinely moved a millimetre does want a new
-/// hull, and the only thing an epsilon would save is a comparison.
+/// Held beside the hull so a caller can check whether the hull is current,
+/// rather than re-placing every door in view every frame: `Collider::place`
+/// walks and re-indexes every triangle, and a portcullis has many. Compared
+/// exactly, the way `place_entities` compares a `Transform`: a game object
+/// that moved a millimetre needs a new hull, and an epsilon would save only a
+/// comparison.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ObjectPlacement {
     pub position: [f32; 3],
@@ -1064,22 +1056,22 @@ pub struct ObjectPlacement {
 
 /// The hulls no tile owns: the game objects the server spawns.
 ///
-/// Three vectors in lockstep and two maps, and the reason for each:
+/// Three vectors in lockstep and two maps, for these reasons:
 ///
-/// * `placed` is every game object decided about, hull or no hull. It is
-///   [`Tile::settled`]'s argument one population over — a model with no
-///   `BoundingTriangles` inserts nothing, so "is it in `index`" answers no for
-///   ever and a caller that took that as "not decided yet" would re-read the M2,
-///   re-place a hull and re-insert nothing, once per frame per campfire.
-/// * `index` is the ones that do have a hull, so a removal is O(1) rather than a
-///   scan — a door opening and shutting is the ordinary case, not the rare one.
-/// * `guids` exists only so `swap_remove` can re-point whatever it moved.
+/// * `placed` is every game object decided about, hull or no hull, for the
+///   same reason as [`Tile::settled`]. A model with no `BoundingTriangles`
+///   inserts nothing, so it is never in `index`, and a caller that read that
+///   as "not decided yet" would re-read the M2, re-place a hull and re-insert
+///   nothing, once per frame per campfire.
+/// * `index` holds the ones that have a hull, so a removal is O(1) rather than
+///   a scan. A door opening and shutting is the common case.
+/// * `guids` exists only so `swap_remove` can re-point the entry it moved.
 #[derive(Default)]
 struct Objects {
     placed: HashMap<u64, ObjectPlacement>,
     index: HashMap<u64, usize>,
     guids: Vec<u64>,
-    /// In `solids` order, for [`Tile::boxes`]' reason exactly.
+    /// In `solids` order, for the reason given on [`Tile::boxes`].
     boxes: Vec<[[f32; 3]; 2]>,
     solids: Vec<Arc<Collider>>,
 }
@@ -1100,8 +1092,8 @@ impl Objects {
     }
 
     /// Drop this object's hull, keeping the three vectors and the index in step.
-    /// The placement record is not touched: two callers want opposite things
-    /// from it, and both say so themselves.
+    /// The placement record is not touched: the two callers need opposite
+    /// things from it, and each updates it itself.
     fn drop_hull(&mut self, guid: u64) {
         let Some(at) = self.index.remove(&guid) else {
             return;
@@ -1109,7 +1101,7 @@ impl Objects {
         self.guids.swap_remove(at);
         self.boxes.swap_remove(at);
         self.solids.swap_remove(at);
-        // Whatever `swap_remove` pulled into the hole now answers to a different
+        // The entry `swap_remove` moved into the hole now has a different
         // index. Nothing moved when the hole was the last slot.
         if let Some(&moved) = self.guids.get(at) {
             self.index.insert(moved, at);
@@ -1148,7 +1140,7 @@ impl CollisionWorld {
         CollisionWorld::default()
     }
 
-    /// Add a placed hull — a building, a doodad or a piece of furniture —
+    /// Add a placed hull (a building, a doodad or a piece of furniture),
     /// dropping everything on a different map first.
     pub fn insert(
         &self,
@@ -1164,19 +1156,19 @@ impl CollisionWorld {
             inner.map_id = Some(map_id);
         }
         let placed = inner.tiles.entry(tile).or_default();
-        // The placement is settled by the arrival of its hull and not by the
-        // decision to place one, which is why this is here rather than at the
-        // call site: a building's `Collider::place` runs on the compute pool
-        // and Stormwind's cost 27.6 ms, so a caller that recorded the answer
-        // when it started would open exactly the window this is about.
+        // The placement is settled when its hull arrives, not when the caller
+        // decides to place one, so this is here rather than at the call site.
+        // A building's `Collider::place` runs on the compute pool and
+        // Stormwind's takes 27.6 ms; a caller that marked the placement
+        // settled when it started would leave that long a window in which the
+        // placement counts as settled and has no hull.
         placed.settled.insert(id.placement);
         match placed.ids.get(&id) {
             // The same id arriving again is the same placement placed again:
             // a building read from a re-read tile after a move, or a new
             // placement minted under an id an undone one had. The new hull
-            // replaces the old one in place. Ignoring it left the old hull
-            // standing where the placement used to be and gave the new
-            // position none.
+            // replaces the old one in place. Ignoring it would leave the old
+            // hull at the old position and no hull at the new one.
             Some(&index) => {
                 placed.boxes[index] = collider.bounds();
                 placed.solids[index] = collider;
@@ -1186,9 +1178,9 @@ impl CollisionWorld {
                 }
             }
             None => {
-                // The box and the kind first and in lockstep: `Tile::boxes`
-                // and `Tile::kinds` are only sound while they are the same
-                // length and the same order as `solids`, and this and
+                // The box and the kind are pushed in lockstep with the hull:
+                // `Tile::boxes` and `Tile::kinds` are valid only while they
+                // have the same length and order as `solids`, and this and
                 // `Tile::retain_hulls` are the only places any of the three
                 // is written.
                 if kind == Solid::Building {
@@ -1205,9 +1197,9 @@ impl CollisionWorld {
     /// Move every hull of one placement, the building's or the doodad's own
     /// and every furniture spawn inside it, by `delta`, a column-major world
     /// space matrix. Returns how many hulls moved. For a host that moves a
-    /// placement while its tile is on screen: the transform is written live,
-    /// and a hull left where the placement was is an invisible wall in an
-    /// empty field, and a placement with no hull under it.
+    /// placement while its tile is on screen. The transform is written live,
+    /// and a hull left at the old position is an invisible wall there and
+    /// leaves the placement with no hull.
     pub fn move_placement(&self, map_id: u32, unique_id: u32, delta: &[f32; 16]) -> usize {
         let mut inner = self.write();
         if inner.map_id != Some(map_id) {
@@ -1272,12 +1264,12 @@ impl CollisionWorld {
         }
     }
 
-    /// Record that a placement has been decided about and has no hull —
-    /// the file carries no `BoundingTriangles`, or would not load at all.
+    /// Record that a placement has been decided about and has no hull: the
+    /// file carries no `BoundingTriangles`, or does not load.
     ///
-    /// See [`Tile::settled`]. Without this a hull-less building is a permanent
-    /// hole in the world's answer: the point is inside its `MODF` box and no
-    /// hull ever arrives, so a mover that waits for one never lands.
+    /// See [`Tile::settled`]. Without this, a point inside a hull-less
+    /// building's `MODF` box waits for a hull that never arrives, and a mover
+    /// waiting on it never lands.
     pub fn settle(&self, map_id: u32, tile: (u32, u32), placement: u32) {
         let mut inner = self.write();
         if inner.map_id != Some(map_id) {
@@ -1287,13 +1279,13 @@ impl CollisionWorld {
         inner.tiles.entry(tile).or_default().settled.insert(placement);
     }
 
-    /// Has this `MODF` placement been decided about yet? — see
+    /// Whether this `MODF` placement has been decided about. See
     /// [`Tile::settled`].
     ///
-    /// Asked across every resident tile rather than at one coordinate, because
-    /// a building is claimed by the tile its origin stands on and a character
-    /// standing under it may well be on the next tile along. A dozen hash
-    /// lookups at worst, once per floor query.
+    /// Checked across every resident tile rather than at one coordinate,
+    /// because a building belongs to the tile its origin stands on and a
+    /// character under it can be on the next tile. At most a dozen hash
+    /// lookups, once per floor query.
     pub fn settled(&self, map_id: u32, placement: u32) -> bool {
         let inner = self.read();
         inner.map_id == Some(map_id)
@@ -1303,13 +1295,13 @@ impl CollisionWorld {
     /// Place a game object's hull, replacing whatever this GUID had before.
     ///
     /// `hull` is `None` for an object that has been decided about and has
-    /// nothing solid in it — a campfire, a fishing bobber, a light — which is
-    /// most of them and is a finished answer, not a failure. See
-    /// [`Objects::placed`] for why that has to be recorded rather than inferred.
+    /// nothing solid in it (a campfire, a fishing bobber, a light). That covers
+    /// most game objects and is a finished answer, not a failure. See
+    /// [`Objects::placed`] for why it is recorded rather than inferred.
     ///
-    /// One call rather than [`Self::insert`]'s two, because unlike a `MODF` row
-    /// the caller here always knows both halves at once: it has the model in
-    /// hand when it decides.
+    /// One call rather than the two of [`Self::insert`] and [`Self::settle`],
+    /// because unlike for a `MODF` row the caller has the model loaded when it
+    /// decides, and so knows both the placement and the hull at once.
     pub fn place_object(
         &self,
         map_id: u32,
@@ -1329,7 +1321,7 @@ impl CollisionWorld {
             let objects = &mut inner.objects;
             objects.index.insert(guid, objects.solids.len());
             objects.guids.push(guid);
-            // The box first and in lockstep, exactly as `insert` does it.
+            // The box is pushed in lockstep with the hull, as in `insert`.
             objects.boxes.push(collider.bounds());
             objects.solids.push(collider);
         }
@@ -1338,8 +1330,8 @@ impl CollisionWorld {
     /// What this game object's hull was placed for, or `None` if it has
     /// never been decided about on this map.
     ///
-    /// The caller's test for "is what I am holding still right": a door that has
-    /// not moved answers the placement it was given and wants no work at all.
+    /// The caller uses it to check whether its hull is current: a door that has
+    /// not moved returns the placement it was given and needs no work.
     pub fn object_placement(&self, map_id: u32, guid: u64) -> Option<ObjectPlacement> {
         let inner = self.read();
         if inner.map_id != Some(map_id) {
@@ -1348,19 +1340,18 @@ impl CollisionWorld {
         inner.objects.placed.get(&guid).copied()
     }
 
-    /// Is this game object's hull standing in the world, as opposed to
-    /// merely having a placement on record?
+    /// Whether this game object has a hull in the world, as opposed to only a
+    /// placement on record.
     ///
-    /// The two are different states and [`Self::place_object`] writes both from
-    /// one call, so nothing else can tell them apart. A `.wmo` transport out of
-    /// hull-building range, a model with no `BoundingTriangles` and a model the
-    /// loader gave up on all have a placement and no hull.
+    /// The two are different states and [`Self::place_object`] writes both in
+    /// one call, so only this query tells them apart. A `.wmo` transport out of
+    /// hull-building range, a model with no `BoundingTriangles` and a model
+    /// that failed to load all have a placement and no hull.
     ///
     /// The difference decides whether a passenger has stepped ashore. A
-    /// character who is aboard and is not standing on any hull has walked off
-    /// the deck *only if the deck's hull was there to be walked off*; with no
-    /// hull there is no evidence either way, and reading that as a step ashore
-    /// strands the passenger. See
+    /// character who is aboard and not standing on any hull has walked off the
+    /// deck only if the deck has a hull. With no hull there is no evidence
+    /// either way, and treating it as a step ashore strands the passenger. See
     /// `vale_protocol::socket::session::World::platform_hulled`.
     pub fn object_hulled(&self, map_id: u32, guid: u64) -> bool {
         let inner = self.read();
@@ -1369,15 +1360,15 @@ impl CollisionWorld {
 
     /// Forget every game object not in `live`.
     ///
-    /// Called with the ones that are both in view and solid, so this is how
-    /// a door that has opened stops blocking as well as how one the server has
-    /// stopped describing goes away. Both are the same statement — *this GUID
-    /// has no hull here now* — and giving them one door means an open door and a
-    /// despawned one cannot get different treatment by accident.
+    /// Called with the ones that are both in view and solid, so this removes
+    /// both a door that has opened and an object the server no longer
+    /// describes. In both cases the GUID has no hull now, and handling them on
+    /// one path means an open door and a despawned one cannot be treated
+    /// differently by mistake.
     pub fn retain_objects(&self, live: &HashSet<u64>) {
-        // Under a read lock first, for `retain_tiles`' reason: the steady state
-        // is that nothing has changed, and taking the write lock every frame
-        // would block the session thread's floor query for nothing.
+        // Under a read lock first, for the reason given in `retain_tiles`: in
+        // the steady state nothing has changed, and taking the write lock
+        // every frame would block the session thread's floor query.
         if self.read().objects.placed.keys().all(|g| live.contains(g)) {
             return;
         }
@@ -1405,9 +1396,9 @@ impl CollisionWorld {
     /// write lock is held only to move them out.
     pub fn retain_tiles(&self, live: &HashSet<(u32, u32)>) -> Retired {
         // Checked under a read lock first, because the caller is a Bevy system
-        // running every frame and the steady state is "nothing has changed" —
-        // taking the write lock sixty times a second would block the session
-        // thread's floor query for no reason at all.
+        // running every frame and in the steady state nothing has changed.
+        // Taking the write lock sixty times a second would block the session
+        // thread's floor query.
         if self.read().tiles.keys().all(|k| live.contains(k)) {
             return Retired(Vec::new());
         }
@@ -1443,21 +1434,20 @@ impl CollisionWorld {
         (hulls, triangles)
     }
 
-    /// Every hull standing within `radius` of `centre`, handed over one at a
-    /// time — for a debug overlay that draws what the character can actually
-    /// walk into.
+    /// Every hull within `radius` of `centre`, passed to `visit` one at a time,
+    /// for a debug overlay that draws the surfaces the character collides
+    /// with.
     ///
-    /// The one thing in this module that exists for a picture rather than for
-    /// a query, and it is here rather than in the renderer for the reason
-    /// everything else about a rule is: the box rejection, the two populations
-    /// and the map check are this file's, and a second copy of them in
-    /// `vale-client` would be a second thing to get wrong. The renderer is
-    /// handed triangles.
+    /// The only function in this module that serves drawing rather than a
+    /// query. It is here rather than in the renderer because the box
+    /// rejection, the two populations and the map check belong to this file,
+    /// and a second copy of them in `vale-client` could diverge. The renderer
+    /// receives triangles.
     ///
-    /// Bounded by the caller's radius and by nothing else. There are ~3,800
-    /// hulls in a loaded world and some of them are a whole cathedral, so a
-    /// visitor with no radius is a frame that draws a million lines; the point
-    /// of the overlay is the ground you are standing on.
+    /// Bounded only by the caller's radius. A loaded world holds ~3,800 hulls
+    /// and some are a whole cathedral, so an unbounded visit draws a million
+    /// lines in one frame; the overlay is meant to show the ground around the
+    /// character.
     ///
     /// A visitor rather than an iterator because the hulls live behind an
     /// `RwLock` this must not hand out.
@@ -1487,18 +1477,18 @@ impl CollisionWorld {
         self.surface(map_id, x, y, ceiling).map(|(z, _)| z)
     }
 
-    /// …and the slope it lies at — see [`Collider::surface`]. One walk of the
-    /// candidate hulls answers both, so a stance and a footing cannot disagree
-    /// about which building won.
+    /// The surface [`Self::floor`] returns, with its slope. See
+    /// [`Collider::surface`]. One walk of the candidate hulls returns both, so
+    /// the height and the slope always come from the same building.
     pub fn surface(&self, map_id: u32, x: f32, y: f32, ceiling: f32) -> Option<(f32, [f32; 3])> {
         let inner = self.read();
         if inner.map_id != Some(map_id) {
             return None;
         }
         let mut best: Option<(f32, [f32; 3])> = None;
-        // The box test `Collider::floor` opens with, asked of the tile's own
-        // box vector so a hull the point misses is never dereferenced. Same
-        // three comparisons, same answer — see [`Tile::boxes`].
+        // The box test `Collider::floor` begins with, made against the tile's
+        // box vector so a hull the point misses is never dereferenced. The
+        // comparisons and the result are the same. See [`Tile::boxes`].
         let over = |bounds: &[[f32; 3]; 2]| {
             x >= bounds[0][0]
                 && x <= bounds[1][0]
@@ -1516,13 +1506,14 @@ impl CollisionWorld {
         best
     }
 
-    /// The building floor under a point, and its group's `MOGP` flags — see
+    /// The building floor under a point, and its group's `MOGP` flags. See
     /// [`Collider::building_floor`]. The highest across every building hull
-    /// that answers, so a bridge over a courtyard is the bridge.
+    /// that has one, so over a courtyard spanned by a bridge the answer is the
+    /// bridge.
     ///
     /// Only a hull that carries groups answers, which is every `MODF` building
-    /// and nothing else: a crate on a street is a surface to stand on and says
-    /// nothing about whether the street is outdoors.
+    /// and nothing else: a crate on a street is a surface to stand on but does
+    /// not say whether the street is outdoors.
     pub fn building_floor(&self, map_id: u32, x: f32, y: f32, ceiling: f32) -> Option<(f32, u32)> {
         let inner = self.read();
         if inner.map_id != Some(map_id) {
@@ -1550,24 +1541,24 @@ impl CollisionWorld {
     }
 
     /// Which game object's hull is directly under this point, and how high
-    /// its surface is — or `None` where the highest thing underfoot is terrain
-    /// or a building.
+    /// its surface is. `None` where the highest thing underfoot is terrain or
+    /// a building.
     ///
-    /// The one query in this file that answers whose rather than what, and
-    /// it exists for one population: a character standing on a moving platform
-    /// has to know which platform, because the relationship the wire wants is
-    /// `MOVEFLAG_ONTRANSPORT` plus a guid plus a position in that object's own
-    /// frame. See `vale_protocol::state::movement::Ferry`.
+    /// The only query in this file that returns which hull rather than a
+    /// surface. A character standing on a moving platform needs to know which
+    /// platform, because the movement packet carries `MOVEFLAG_ONTRANSPORT`, a
+    /// guid, and a position in that object's frame. See
+    /// `vale_protocol::state::movement::Ferry`.
     ///
-    /// It asks only the objects, deliberately: a tile's buildings and its
-    /// terrain cannot move, so a surface either of them wins is by definition
-    /// not a platform. That also makes it cheap — the object list is a few
-    /// dozen entries where a city tile's building list is thousands.
+    /// It tests only the game objects: a tile's buildings and terrain cannot
+    /// move, so a surface either of them provides is not a platform. That also
+    /// makes it cheap, since the object list is a few dozen entries where a
+    /// city tile's hull list is thousands.
     ///
-    /// It answers for a door and a chest as readily as for a lift, because
-    /// nothing here knows which objects move. The caller decides: the session
-    /// asks the object manager whether the guid carries `UPDATEFLAG_TRANSPORT`,
-    /// which is the only thing in the game that says so.
+    /// It returns a door or a chest as readily as a lift, because nothing here
+    /// knows which objects move. The caller decides: the session asks the
+    /// object manager whether the guid carries `UPDATEFLAG_TRANSPORT`, the only
+    /// data that marks an object as a transport.
     pub fn object_under(&self, map_id: u32, x: f32, y: f32, ceiling: f32) -> Option<(u64, f32)> {
         let inner = self.read();
         if inner.map_id != Some(map_id) {
@@ -1586,29 +1577,28 @@ impl CollisionWorld {
                 continue;
             };
             if best.is_none_or(|(_, b)| z > b) {
-                // `guids` runs parallel to `solids`, which `drop_hull` keeps
-                // true through its `swap_remove` triple.
+                // `guids` runs parallel to `solids`; `drop_hull` keeps them
+                // parallel by applying `swap_remove` to all three vectors.
                 best = Some((objects.guids[n], z));
             }
         }
         best
     }
 
-    /// The same question as [`Self::floor`], asked of many points at once
-    /// that share one box and one ceiling.
+    /// [`Self::floor`] for many points at once that share one box and one
+    /// ceiling.
     ///
-    /// The saving is the candidate scan, not the lock. Every query in here
-    /// opens by walking [`Tile::boxes`] — up to 3,817 hulls on a city tile, nine
-    /// tiles loaded — and rejecting the hulls the point misses. Asked point by
-    /// point that walk is repeated per point, so a decal grid of eighty-one
-    /// samples pays it eighty-one times for a footprint a couple of yards
-    /// across, where every one of those walks admits the same one or two hulls.
-    /// Here the walk happens once, against the grid's own box, and the
-    /// survivors are then asked about each point.
+    /// The saving is the candidate scan, not the lock. Every query here begins
+    /// by walking [`Tile::boxes`] (up to 3,817 hulls on a city tile, nine tiles
+    /// loaded) and rejecting the hulls the point misses. Point by point, a
+    /// decal grid of eighty-one samples repeats that walk eighty-one times for
+    /// a footprint a couple of yards across, and every walk admits the same one
+    /// or two hulls. Here the walk runs once, against the grid's box, and each
+    /// point is then tested against the hulls it admitted.
     ///
-    /// `points` are `(x, y)` in world coordinates and the answers come back
-    /// parallel to them. A point with nothing over it answers `None`, exactly as
-    /// the single-point form does.
+    /// `points` are `(x, y)` in world coordinates and the results are written
+    /// parallel to them. A point with nothing over it gets `None`, as in the
+    /// single-point form.
     pub fn floor_batch(
         &self,
         map_id: u32,
@@ -1648,22 +1638,20 @@ impl CollisionWorld {
     /// How far along `from` -> `to` the first solid surface is, as a fraction of
     /// that segment, or `None` for a clear line.
     ///
-    /// The camera's question, and only the camera's. A fraction rather than
-    /// a point because the caller wants to stop short of the hit by a margin,
-    /// and a fraction is the form that survives being shortened.
+    /// Used by the camera only. A fraction rather than a point because the
+    /// caller stops short of the hit by a margin, and a fraction can be
+    /// reduced directly.
     pub fn ray(&self, map_id: u32, from: [f32; 3], to: [f32; 3]) -> Option<f32> {
         self.ray_of(map_id, from, to, Surfaces::ALL)
     }
 
-    /// …and the same cast narrowed to some of the populations — see
-    /// [`Surfaces`].
+    /// [`Self::ray`] narrowed to some of the populations. See [`Surfaces`].
     ///
-    /// The other caller with a ray, and it is asking a different question.
-    /// The camera wants anything at all between the eye and the character. A
-    /// caller placing something in the world wants the surface it is going to
-    /// stand the thing on, and it may only answer with a population that is
-    /// being drawn: with the buildings switched off, a roof is not a surface,
-    /// it is a place the thing placed would disappear into.
+    /// The camera needs any surface between the eye and the character. A
+    /// caller placing something in the world needs the surface it will stand
+    /// the thing on, and that surface must belong to a population that is
+    /// being drawn: with the buildings hidden, an object placed on a roof
+    /// would be out of sight.
     pub fn ray_of(
         &self,
         map_id: u32,
@@ -1696,15 +1684,15 @@ impl CollisionWorld {
         best.map(|d| d / length)
     }
 
-    /// Where a stride from `from` to `to` actually ends.
+    /// Where a stride from `from` to `to` ends.
     ///
-    /// Only the horizontal part is decided here — the vertical is
-    /// [`CollisionWorld::floor`]'s. Motion is cancelled, never reversed:
-    /// each blocking wall takes away the component of the stride heading into
-    /// it and leaves the component along it, so a character walks along a wall
-    /// rather than sticking to it, and a character who somehow ends up inside
-    /// geometry can always walk back out. Three walls in one stride is a corner,
-    /// and the answer there is to stand still.
+    /// Only the horizontal part is decided here; the vertical is decided by
+    /// [`CollisionWorld::floor`]. Motion is cancelled, never reversed: each
+    /// blocking wall removes the component of the stride heading into it and
+    /// keeps the component along it, so a character slides along a wall rather
+    /// than sticking to it, and a character inside geometry can always walk
+    /// back out. Three walls in one stride is a corner, and the character
+    /// stands still.
     pub fn step(&self, map_id: u32, from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
         let inner = self.read();
         if inner.map_id != Some(map_id) || inner.nothing_placed() {
@@ -1721,15 +1709,14 @@ impl CollisionWorld {
                 break;
             };
             // The cancels are spent and something is still in the way: stand
-            // still. This used to fall out of the loop and apply whatever
-            // motion was left, which is a character walking out through the
-            // corner they are wedged into. The loop runs one pass more than
-            // there are cancels so that the last cancel is checked rather
-            // than assumed to have worked.
+            // still. Applying the remaining motion instead would walk the
+            // character out through the corner they are wedged into. The loop
+            // runs one pass more than there are cancels so that the last
+            // cancel is checked rather than assumed to have worked.
             //
-            // Standing still cannot trap anybody: motion is cancelled and never
-            // reversed, so every direction out of the corner is still offered
-            // in full on the next stride.
+            // Standing still cannot trap the character: motion is cancelled
+            // and never reversed, so every direction out of the corner is
+            // still available in full on the next stride.
             if attempt == CANCELS {
                 return [from[0], from[1], to[2]];
             }
@@ -1756,53 +1743,47 @@ impl CollisionWorld {
 
 /// The nearest wall normal any probe meets along `dir`.
 ///
-/// A character is a body rather than a line, and this is where that is said.
-/// The probe used to be one ray up the centre axis at each of [`PROBE_HEIGHTS`],
-/// which stops a stride only when something is dead ahead of the character's
-/// own middle. Everything a shoulder would hit went straight through: a fence
-/// post, a tree trunk, the jamb of a doorway walked into at an angle, the
-/// corner of a crate — and a wall met so obliquely that the centre ray leaves
-/// through its far edge before the body arrives. That is the whole of *"it is
-/// extremely easy to clip through doodads and WMOs"*, and no number of extra
-/// heights reaches any of it, because the gap is sideways.
+/// A single ray along the centre axis at each of [`PROBE_HEIGHTS`] stops a
+/// stride only when something is directly ahead of the character's centre.
+/// It misses everything a shoulder would hit: a fence post, a tree trunk, the
+/// jamb of a doorway approached at an angle, the corner of a crate, and a wall
+/// met so obliquely that the centre ray leaves through its far edge before the
+/// body arrives. Extra heights do not help, because the gap is sideways.
 ///
-/// So the sweep is [`PROBE_LANES`]: the centre line and one down each side at
-/// [`PLAYER_RADIUS`], perpendicular to the stride. Three parallel rays at each
-/// height approximate the swept box of a body a yard wide, which is what the
-/// reference sweeps and is as close to it as a ray budget allows.
+/// The sweep therefore uses [`PROBE_LANES`]: the centre line and one line on
+/// each side at [`PLAYER_RADIUS`], perpendicular to the stride. Three parallel
+/// rays at each height approximate the swept box of a body a yard wide.
 ///
-/// The hulls are still scanned once for the whole sweep, not once per ray.
-/// The rays differ only in `z` and in a sideways offset, so one box covering
-/// all of them rejects for all of them — which keeps the scan over a city's
-/// 3,817 hulls at one pass, and the boxes it walks are the tile's own
-/// contiguous copies rather than a pointer chase per hull (see [`Tile::boxes`]).
-/// A hull that survives is then asked at each ray.
+/// The hulls are scanned once for the whole sweep, not once per ray. The rays
+/// differ only in `z` and in a sideways offset, so one box covering all of
+/// them rejects for all of them. That keeps the scan over a city's 3,817 hulls
+/// to one pass over the tile's contiguous box copies, with no pointer chase
+/// per hull (see [`Tile::boxes`]). Each hull that passes is then tested with
+/// every ray.
 ///
-/// ## …and the one that wins is the most head-on, not the nearest
+/// ## The most head-on wall wins, not the nearest
 ///
-/// Which mattered not at all with a single lane and decides the answer with
-/// three. A shoulder ray walking past a barrel meets the barrel's side, whose
-/// outward normal is nearly perpendicular to the stride; the centre ray meets
-/// its front. Rank those by distance and the side can win — and then
-/// [`CollisionWorld::step`] has nothing to cancel, because the component of the
-/// stride heading into a wall it is running along is zero. Its `into >= 0.0`
-/// arm reads that as "travelling along it, nothing to do", breaks, and applies
-/// the whole stride: the character walks through the front face because a side
-/// face was closer to one of their shoulders.
+/// With three lanes the ranking decides the result. A shoulder ray passing a
+/// barrel meets the barrel's side, whose outward normal is nearly
+/// perpendicular to the stride; the centre ray meets its front. Ranked by
+/// distance, the side can win, and then [`CollisionWorld::step`] has nothing
+/// to cancel, because the component of the stride heading into a wall it runs
+/// along is zero. Its `into >= 0.0` arm treats that as travelling along the
+/// wall, breaks, and applies the whole stride, so the character walks through
+/// the front face.
 ///
-/// Measured over the doodad hulls' own vertical faces walked straight into,
-/// which `vale collision <map> <tx> <ty>` counts: ranked by distance,
+/// `vale collision <map> <tx> <ty>` counts the doodad hulls' vertical faces
+/// that stop a stride walked straight into them. Ranked by distance,
 /// Ironforge's tile blocks 43,976 of 43,985 and Stormwind's 76,303 of 76,309;
-/// ranked this way, both are all of them. So the ranking is not a
-/// refinement of the sweep, it is what stops the sweep from making the answer
-/// worse than the single ray it replaced.
+/// ranked by how head-on the wall is, both block all of them. Without this
+/// ranking the three-lane sweep blocks fewer faces than a single centre ray.
 ///
-/// Distance still breaks a tie, which is what keeps a wall in front of another
-/// wall of the same orientation being the one that stops the stride.
+/// Distance breaks a tie, so of two walls with the same orientation the
+/// nearer one stops the stride.
 fn wall_ahead(inner: &Inner, from: [f32; 3], dir: [f32; 3], distance: f32) -> Option<[f32; 3]> {
-    // `(into, distance, normal)`, smallest `into` first. Every normal comes
-    // back already flipped to face the ray, so `into` is at most zero and the
-    // most negative is the most opposed.
+    // `(into, distance, normal)`, smallest `into` first. Every normal is
+    // already flipped to face the ray, so `into` is at most zero and the most
+    // negative is the most opposed.
     let mut best: Option<(f32, f32, [f32; 3])> = None;
     let (low, high) = PROBE_HEIGHTS
         .iter()
@@ -1816,18 +1797,17 @@ fn wall_ahead(inner: &Inner, from: [f32; 3], dir: [f32; 3], distance: f32) -> Op
         from[1] + dir[1] * distance,
         from[2] + high + dir[2] * distance,
     ];
-    // The rejection is against the segment's box grown by the sweep's own
-    // half-width, and the growth goes on the hull's box rather than on the
-    // segment's ends. Offsetting the two endpoints instead is the obvious
-    // thing and it is wrong: `segment_meets` takes their axis-aligned extent,
-    // so moving one end out and the other in shrinks that extent on every axis
-    // the stride is travelling backwards along. Measured while it was wrong —
-    // Ironforge's doodad hulls went from 43,979 of 43,985 vertical faces
-    // stopping a stride to 43,787, because the hull holding the face was being
-    // rejected before any ray was cast at it. Ironforge's tile: 5 us a
-    // floor+step pair with the box wrong, 11 us with it right; Stormwind's,
-    // over 3,726 hulls, 17 us against 14 for a single lane. Both against a
-    // 50 ms mover tick.
+    // The rejection tests the segment against the hull's box grown by the
+    // sweep's half-width. The growth goes on the hull's box, not on the
+    // segment's ends: `segment_meets` takes the endpoints' axis-aligned
+    // extent, so moving one end out and the other in shrinks that extent on
+    // every axis the stride travels backwards along. With the endpoints
+    // offset, Ironforge's doodad hulls stopped 43,787 of 43,985 vertical faces
+    // instead of 43,979, because the hull holding the face was rejected before
+    // any ray was cast at it. Ironforge's tile: 5 us a floor+step pair with the
+    // endpoints offset, 11 us with the box grown; Stormwind's, over 3,726
+    // hulls, 17 us against 14 for a single lane. Both against a 50 ms mover
+    // tick.
     let grow = |bounds: &[[f32; 3]; 2]| {
         [
             [
@@ -1864,66 +1844,67 @@ fn wall_ahead(inner: &Inner, from: [f32; 3], dir: [f32; 3], distance: f32) -> Op
 }
 
 // ---------------------------------------------------------------------------
-// …and the other question a ray gets asked: where does it meet the floor?
+// Where a ray meets the floor
 // ---------------------------------------------------------------------------
 
 /// How far apart the samples are, in yards.
 ///
-/// A ground-target ray is answered by walking it, not by intersecting it, and
-/// the reason is that the two surfaces it can land on are asked about in
-/// completely different ways: the terrain is a heightfield with no triangles at
-/// all (see [`crate::Terrain::height_at`]) and a building is a hull behind a
-/// lock. A march asks both the one question they share.
+/// A ground-target ray is resolved by marching along it, not by intersecting
+/// it, because the two surfaces it can land on are queried differently: the
+/// terrain is a heightfield with no triangles (see
+/// [`crate::Terrain::height_at`]) and a building is a hull behind a lock. A
+/// march uses the one query both support, a floor height at a point.
 ///
-/// Half a yard is under a character's width, and the refinement below takes the
-/// residual to a few centimetres — which is well inside the yard and a quarter
-/// of slack the server's own range check carries.
+/// Half a yard is under a character's width, and the refinement below reduces
+/// the residual to a few centimetres, well inside the yard and a quarter of
+/// slack the server's range check allows.
 const GROUND_STEP: f32 = 0.5;
 
-/// How fast the step grows with distance — the reciprocal, so the step at
-/// `t` is `t / GROUND_STEP_SPREAD` once that exceeds [`GROUND_STEP`].
+/// How fast the step grows with distance, as a reciprocal: the step at `t` is
+/// `t / GROUND_STEP_SPREAD` once that exceeds [`GROUND_STEP`].
 ///
-/// A fixed half-yard step is the right size near the camera and pointless
+/// A fixed half-yard step suits distances near the camera and is needless
 /// precision a thousand yards out, where half a yard is a fraction of a screen
-/// pixel: at a 90-degree horizontal field of view over 1,280 pixels one pixel
+/// pixel. At a 90-degree horizontal field of view over 1,280 pixels one pixel
 /// subtends about 0.0012 radians, so a step of `t / 300` is roughly two pixels
-/// at any distance. That is fine for the only thing the step size decides —
-/// not tunnelling through a ridge — because a ridge two pixels wide is not
-/// something anybody is aiming at, and the bisection below owns the precision.
+/// at any distance. The step size decides only whether the march tunnels
+/// through a ridge, a ridge two pixels wide is not a target, and the bisection
+/// below provides the precision.
 ///
-/// 300 rather than a rounder number so that the crossover is exactly the range
-/// this walk used to stop at: `t / 300` reaches [`GROUND_STEP`] at 150 yards,
-/// so everything inside the old bound is sampled exactly as it was and the
-/// change is only in what happens past it.
+/// 300 rather than a rounder number so that `t / 300` reaches [`GROUND_STEP`]
+/// at 150 yards, the range the march was previously limited to. Everything
+/// inside 150 yards is sampled at the fixed step; only the samples past it
+/// are spaced out.
 const GROUND_STEP_SPREAD: f32 = 300.0;
 
-/// The interval the bisection below stops at, in yards — the 3 cm the old fixed
-/// four halvings of a half-yard step produced, written as the number it was
-/// really about now that the step is not fixed.
+/// The interval the bisection below stops at, in yards: 3 cm, the result of
+/// four halvings of a half-yard step.
 const GROUND_REFINE_TO: f32 = GROUND_STEP / 16.0;
 
-/// …and the most halvings it may take to get there. Reached only by a step that
-/// has grown past 30 yards, which is a `max_distance` of about nine thousand.
+/// The most halvings the bisection may take to reach [`GROUND_REFINE_TO`].
+/// Reached only by a step that has grown past 30 yards, which is a
+/// `max_distance` of about nine thousand.
 const GROUND_REFINE_MAX: u32 = 12;
 
-/// Where a ray meets the ground — the floor point under a pointer, which is
-/// the whole of where a Blizzard lands.
+/// Where a ray meets the ground: the floor point under a pointer, which is
+/// where a ground-targeted spell such as Blizzard lands.
 ///
-/// `floor_at(x, y, z)` is the caller's own join of the terrain and the buildings
-/// on it, asked at the height the ray has reached — the same three arguments and
-/// the same meaning as `world::standing::Standing::floor`, passed in rather than
-/// rebuilt here so that a placement and a footstep cannot disagree about what
-/// the floor is. Everything is in WoW's axes, `+Z up`.
+/// `floor_at(x, y, z)` is the caller's combination of the terrain and the
+/// buildings on it, queried at the height the ray has reached. It takes the
+/// same three arguments with the same meaning as
+/// `world::standing::Standing::floor`, and is passed in rather than rebuilt
+/// here so that a placement and a footstep use the same floor. Everything is
+/// in WoW's axes, `+Z up`.
 ///
-/// The answer is the first sample at which the ray has gone under the floor,
-/// refined by bisection and then interpolated — so a ray that grazes a hillside
-/// lands on the hillside rather than at the sample boundary past it. `None` when
-/// the ray runs the whole distance without ever getting below a surface, which
-/// is a pointer aimed at the sky and is a real answer rather than a failure.
+/// The result is the first sample at which the ray is under the floor,
+/// refined by bisection and then interpolated, so a ray that grazes a
+/// hillside lands on the hillside rather than at the next sample past it.
+/// `None` when the ray runs the whole distance without going below a surface,
+/// which is a pointer aimed at the sky and is a valid result, not a failure.
 ///
-/// A ray that starts below the floor answers immediately, at its own
-/// origin: that is a camera inside the ground, and the alternative — walking on
-/// until it comes back out — points at whatever is on the far side of the hill.
+/// A ray that starts below the floor returns its origin immediately. That is
+/// a camera inside the ground, and marching on until the ray comes back out
+/// would point at the far side of the hill.
 pub fn ground_under_ray(
     origin: [f32; 3],
     direction: [f32; 3],
@@ -1947,8 +1928,8 @@ pub fn ground_under_ray(
         ]
     };
     // How far the ray is above the floor at `t`. `None` where there is no
-    // floor at all under that column — a hole in the terrain, or off the edge of
-    // the loaded map — which is neither above nor below and cannot end the walk.
+    // floor under that column (a hole in the terrain, or past the edge of the
+    // loaded map), which is neither above nor below and cannot end the walk.
     let above = |t: f32| {
         let p = at(t);
         floor_at(p[0], p[1], p[2]).map(|floor| p[2] - floor)
@@ -1964,11 +1945,11 @@ pub fn ground_under_ray(
     while t <= max_distance {
         match above(t) {
             Some(gap) if gap <= 0.0 => {
-                // No usable sample behind it means no interval to refine —
-                // the ray came in over a hole or off the edge of the loaded map
-                // and the first thing it found was already under a surface. The
-                // sample itself is the answer; inventing a previous one would
-                // interpolate against a gap nobody measured.
+                // No usable sample before it means no interval to refine: the
+                // ray came in over a hole or past the edge of the loaded map,
+                // and the first sample with a floor is already under it. The
+                // sample itself is the result; inventing a previous one would
+                // interpolate against an unmeasured gap.
                 let Some((mut lo, mut lo_gap)) = previous else {
                     let mut hit = at(t);
                     if let Some(floor) = floor_at(hit[0], hit[1], hit[2]) {
@@ -1989,7 +1970,7 @@ pub fn ground_under_ray(
                             lo_gap = gap;
                         }
                         // No floor under the midpoint: neither half can be
-                        // excluded, so stop refining and take what we have.
+                        // excluded, so refinement stops at the current interval.
                         None => break,
                     }
                 }
@@ -2004,7 +1985,7 @@ pub fn ground_under_ray(
                 };
                 let mut hit = at(cross);
                 // The floor's height rather than the ray's, so the point is on
-                // the surface even where the interpolation lands a hair off it.
+                // the surface even where the interpolation lands slightly off it.
                 if let Some(floor) = floor_at(hit[0], hit[1], hit[2]) {
                     hit[2] = floor;
                 }
@@ -2013,11 +1994,10 @@ pub fn ground_under_ray(
             Some(gap) => previous = Some((t, gap)),
             None => previous = None,
         }
-        // The step grows with distance — see [`GROUND_STEP_SPREAD`]. Out to
-        // 150 yards this is exactly [`GROUND_STEP`] and the walk is the one it
-        // has always been; past that the cost stops being linear in the range,
-        // which is what lets a placed cast reach the edge of the loaded world
-        // rather than stopping at an arbitrary bound.
+        // The step grows with distance; see [`GROUND_STEP_SPREAD`]. Out to
+        // 150 yards it is [`GROUND_STEP`]. Past that the cost is no longer
+        // linear in the range, so a ground-targeted cast can reach the edge of
+        // the loaded world rather than stopping at a fixed bound.
         t += (t / GROUND_STEP_SPREAD).max(GROUND_STEP);
     }
     None
@@ -2027,7 +2007,7 @@ pub fn ground_under_ray(
 // Geometry
 // ---------------------------------------------------------------------------
 
-/// A column-major 4x4 applied to a point — the shape
+/// A column-major 4x4 applied to a point, in the layout
 /// [`crate::world::adt::placement_matrix`] returns.
 pub fn transform_point(m: &[f32; 16], v: [f32; 3]) -> [f32; 3] {
     let mut out = [0.0f32; 3];
@@ -2066,10 +2046,9 @@ fn normal_of(t: &[[f32; 3]; 3]) -> [f32; 3] {
 /// The height of a triangle's plane at `(x, y)`, or `None` when the point is
 /// outside the triangle's XY projection.
 ///
-/// A triangle seen edge-on projects to a sliver of zero area — every wall does
-/// — and answering for one would put the character on top of the wall they are
-/// standing beside. `None` for those, which the edge tests give for free once
-/// the area test rejects them.
+/// A triangle seen edge-on, as every wall is, projects to zero area, and a
+/// height from it would put the character on top of the wall they stand
+/// beside. The area test returns `None` for those.
 fn height_at(t: &[[f32; 3]; 3], x: f32, y: f32) -> Option<f32> {
     let (x0, y0) = (t[0][0], t[0][1]);
     let (x1, y1) = (t[1][0], t[1][1]);
@@ -2086,8 +2065,8 @@ fn height_at(t: &[[f32; 3]; 3], x: f32, y: f32) -> Option<f32> {
     Some(t[0][2] + u * (t[1][2] - t[0][2]) + v * (t[2][2] - t[0][2]))
 }
 
-/// Möller–Trumbore, two-sided: a WMO's winding is not to be trusted as a
-/// statement about which side of a wall the character is on.
+/// Möller–Trumbore, two-sided, because a WMO's winding does not reliably say
+/// which side of a wall the character is on.
 fn ray_triangle(origin: [f32; 3], dir: [f32; 3], t: &[[f32; 3]; 3]) -> Option<f32> {
     let edge1 = sub(t[1], t[0]);
     let edge2 = sub(t[2], t[0]);
@@ -2110,19 +2089,18 @@ fn ray_triangle(origin: [f32; 3], dir: [f32; 3], t: &[[f32; 3]; 3]) -> Option<f3
     Some(f * dot(edge2, q))
 }
 
-/// Every hull a tile places, placed — the doodads and the buildings, ready
-/// to be asked where they are.
+/// Every hull a tile places, in world space: its doodads and its buildings.
 ///
-/// Through a reader rather than an `Assets`, which is this project's own
-/// convention for anything that loads by name. Two callers want this and they hold the
-/// archives differently: `vale bake` has an `Assets`, and a host with a
-/// `GameAssets` has an `Rc<dyn Fn(&str) -> Option<Vec<u8>>>` instead. A
-/// signature naming either would have meant a second copy of this for the other.
+/// Takes a reader rather than an `Assets`, which is this project's convention
+/// for anything that loads by name. The two callers hold the archives
+/// differently: `vale bake` has an `Assets`, and a host with a `GameAssets`
+/// has an `Rc<dyn Fn(&str) -> Option<Vec<u8>>>`. A signature naming either
+/// would need a second copy of this function for the other.
 ///
-/// A model that will not open, will not parse, or carries no collision at all is
-/// skipped rather than reported: the third of those is not a failure but the
-/// game's own meaning of walk-through — grass, birds, flames — and it is most of
-/// what a tile places.
+/// A model that does not open, does not parse, or carries no collision is
+/// skipped rather than reported. A model with no collision is not a failure:
+/// it is one the character walks through (grass, birds, flames), and that is
+/// most of what a tile places.
 ///
 /// Each distinct path is read once however many times it is placed, which for a
 /// forest tile is a few hundred reads against a few thousand placements.
@@ -2133,26 +2111,24 @@ pub fn tile_hulls(
     hulls_near(&[adt], read, None)
 }
 
-/// Every hull placed by any of several tiles that reaches into a box —
-/// the same as [`tile_hulls`] over a neighbourhood, with a bound on what is
-/// kept.
+/// Every hull placed by any of several tiles that reaches into a box: the
+/// same as [`tile_hulls`] over a neighbourhood, with a bound on what is kept.
 ///
-/// A placement is a record in the tile whose `MODF` or `MDDF` carries it, and a
-/// building is carried by the tile its origin stands on. So the hulls that
-/// stand over a tile are not the hulls its own file places: Menethil's
-/// harbour is placed by one tile and its walls fall across the seam onto the
-/// next, and a bake fed only the next tile's own file casts nothing from them.
-/// Reported from the window as a rebake that shadows the tile a building
-/// belongs to and none of the tiles it stands on. The caller passes the tile
-/// and its eight neighbours, and `within` — the tile's box widened by however
-/// far a shadow can fall — is what keeps this from building every hull in nine
-/// tiles to answer for one.
+/// A placement is a record in the tile whose `MODF` or `MDDF` carries it, and
+/// a building is carried by the tile its origin stands on. The hulls that
+/// stand over a tile are therefore not only the hulls its own file places:
+/// Menethil's harbour is placed by one tile and its walls cross the seam onto
+/// the next, and a bake given only the next tile's file casts no shadow from
+/// them. A rebake then shadows the tile the building belongs to and none of
+/// the other tiles it stands on. The caller passes the tile and its eight
+/// neighbours, and `within` (the tile's box widened by the furthest a shadow
+/// can fall) keeps this from building every hull in nine tiles to serve one.
 ///
-/// Three things the neighbourhood needs that one tile did not:
+/// The neighbourhood needs three things a single tile does not:
 ///
 /// * a placement is kept once, by unique id. A model straddling a seam is
 ///   recorded by both tiles with the same `unique_id`, and building it twice
-///   is two hulls in the same place — right, and twice the ray tests;
+///   gives two identical hulls in the same place and twice the ray tests;
 /// * a building is boxed before it is read. A WMO is one root and many
 ///   group files, and the root alone carries `MOHD`'s bounds, so the eight
 ///   corners of that box through the placement matrix decide whether the
@@ -2184,8 +2160,8 @@ pub fn hulls_near(
     };
 
     // The buildings, whose geometry is spread over a root and its groups. The
-    // root is read first and on its own, because it is what says whether the
-    // groups are wanted.
+    // root is read first and alone, because its bounds decide whether the
+    // groups are needed.
     let mut roots: BTreeMap<String, Option<crate::world::wmo::WmoRoot>> = BTreeMap::new();
     let mut meshes: BTreeMap<String, CollisionMesh> = BTreeMap::new();
     for adt in adts {
@@ -2218,7 +2194,7 @@ pub fn hulls_near(
         }
     }
 
-    // …and the doodads, whose hull is one chunk of one file.
+    // The doodads, whose hull is one chunk of one file.
     let mut hulls: BTreeMap<String, Option<CollisionMesh>> = BTreeMap::new();
     for adt in adts {
         for doodad in adt.placed_doodads() {
@@ -2244,6 +2220,248 @@ pub fn hulls_near(
     out
 }
 
+/// Which of a building's triangles cast a baked shadow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildingCasts {
+    /// The solid triangles: the building's collision hull.
+    Hull,
+    /// Every drawn triangle, solid or not.
+    Drawn,
+}
+
+/// A texture's alpha channel, for testing a ray hit against.
+#[derive(Debug, Clone)]
+pub struct AlphaMask {
+    pub width: u32,
+    pub height: u32,
+    /// One byte per texel, row-major.
+    pub alpha: Vec<u8>,
+}
+
+impl AlphaMask {
+    /// The alpha at a texture coordinate, wrapped into 0..1 as a repeating
+    /// sampler wraps it, nearest texel.
+    pub fn at(&self, uv: [f32; 2]) -> u8 {
+        let wrap = |v: f32, n: u32| {
+            let f = v - v.floor();
+            ((f * n as f32) as u32).min(n - 1) as usize
+        };
+        let (x, y) = (wrap(uv[0], self.width), wrap(uv[1], self.height));
+        self.alpha[y * self.width as usize + x]
+    }
+}
+
+/// A triangle that casts only where its texture is opaque: which mask, and
+/// the texture coordinate at each corner.
+#[derive(Debug, Clone, Copy)]
+pub struct Cutout {
+    pub mask: u32,
+    pub uvs: [[f32; 2]; 3],
+}
+
+/// The triangles that cast a baked `MCSH` shadow, in world space.
+#[derive(Debug, Clone, Default)]
+pub struct ShadowCasters {
+    pub triangles: Vec<[[f32; 3]; 3]>,
+    /// Parallel to `triangles`: `None` for a triangle that casts everywhere.
+    pub cutouts: Vec<Option<Cutout>>,
+    pub masks: Vec<AlphaMask>,
+}
+
+/// A model-space mesh ready to place: positions, and per triangle its corners
+/// and its cutout.
+struct CasterMesh {
+    positions: Vec<[f32; 3]>,
+    triangles: Vec<([u32; 3], Option<Cutout>)>,
+}
+
+/// Every triangle that casts a baked `MCSH` shadow into `within`, in world
+/// space: each placed doodad's drawn triangles, and each placed building's
+/// triangles as `buildings` selects.
+///
+/// With `cut_out`, each triangle of a doodad batch that is not opaque (blend
+/// mode other than 0) carries its texture's alpha and texture coordinates, so
+/// a ray can be tested against the texel it hits. Leaf cards are drawn this
+/// way, and testing their alpha brings the share of texels agreeing with the
+/// shipped map from 90.5–98.2% to 96.1–98.9% on the four tiles listed at
+/// `vale_edit::shadow`.
+///
+/// A doodad casts from its drawn triangles, not from its collision hull. A
+/// tree's hull is its trunk and a rough block for the crown, while the shipped
+/// shadow maps cover the whole crown: on `Azeroth_32_49` the hulls find 20.5%
+/// of the shipped shadow and the drawn triangles 98.5%.
+///
+/// Placements are kept once by unique id across `adts`, as in [`hulls_near`].
+/// `within` is tested on x and y only; `None` keeps everything.
+pub fn shadow_casters_near(
+    adts: &[&crate::world::adt::Adt],
+    mut read: impl FnMut(&str) -> Option<Vec<u8>>,
+    within: Option<[[f32; 3]; 2]>,
+    buildings: BuildingCasts,
+    cut_out: bool,
+) -> ShadowCasters {
+    use std::collections::{BTreeMap, HashSet};
+
+    let overlaps = |bounds: [[f32; 3]; 2]| match within {
+        None => true,
+        Some(keep) => {
+            bounds[0][0] <= keep[1][0]
+                && bounds[1][0] >= keep[0][0]
+                && bounds[0][1] <= keep[1][1]
+                && bounds[1][1] >= keep[0][1]
+        }
+    };
+    let mut out = ShadowCasters::default();
+    let mut seen: HashSet<u32> = HashSet::new();
+    let place = |mesh: &CasterMesh, matrix: &[f32; 16], out: &mut ShadowCasters| {
+        let placed: Vec<[f32; 3]> = mesh.positions.iter().map(|&v| transform_point(matrix, v)).collect();
+        let mut bounds = [[f32::MAX; 3], [f32::MIN; 3]];
+        for v in &placed {
+            for axis in 0..3 {
+                bounds[0][axis] = bounds[0][axis].min(v[axis]);
+                bounds[1][axis] = bounds[1][axis].max(v[axis]);
+            }
+        }
+        if placed.is_empty() || !overlaps(bounds) {
+            return;
+        }
+        for (corners, cutout) in &mesh.triangles {
+            let corner = |i: u32| placed.get(i as usize).copied();
+            if let (Some(a), Some(b), Some(c)) = (corner(corners[0]), corner(corners[1]), corner(corners[2])) {
+                out.triangles.push([a, b, c]);
+                out.cutouts.push(*cutout);
+            }
+        }
+    };
+    let solid = |indices: &[u32]| -> Vec<([u32; 3], Option<Cutout>)> {
+        indices.chunks_exact(3).map(|t| ([t[0], t[1], t[2]], None)).collect()
+    };
+
+    // Buildings. The root is read first, and its bounds through the placement
+    // decide whether the groups are read at all.
+    let mut roots: BTreeMap<String, Option<crate::world::wmo::WmoRoot>> = BTreeMap::new();
+    let mut meshes: BTreeMap<String, CasterMesh> = BTreeMap::new();
+    for adt in adts {
+        for building in adt.placed_wmos() {
+            if !seen.insert(building.unique_id) {
+                continue;
+            }
+            let root = roots.entry(building.path.clone()).or_insert_with(|| {
+                read(&building.path).and_then(|raw| crate::world::wmo::WmoRoot::parse(&raw).ok())
+            });
+            let Some(root) = root else { continue };
+            if !overlaps(placed_box(root.bounds, &building.matrix)) {
+                continue;
+            }
+            if !meshes.contains_key(&building.path) {
+                let mut groups = Vec::new();
+                for index in 0..root.group_count {
+                    if let Some(group) = read(&crate::world::wmo::group_path(&building.path, index))
+                        .and_then(|b| crate::world::wmo::WmoGroup::parse(&b).ok())
+                    {
+                        groups.push(group);
+                    }
+                }
+                let mesh = match buildings {
+                    BuildingCasts::Hull => {
+                        let hull = CollisionMesh::build(&groups);
+                        CasterMesh {
+                            triangles: solid(&hull.indices),
+                            positions: hull.positions,
+                        }
+                    }
+                    BuildingCasts::Drawn => {
+                        let (mut positions, mut indices) = (Vec::new(), Vec::new());
+                        for group in groups.iter().filter(|g| !g.is_antiportal()) {
+                            let base = positions.len() as u32;
+                            positions.extend_from_slice(&group.positions);
+                            indices.extend(group.indices.iter().map(|&i| base + u32::from(i)));
+                        }
+                        CasterMesh {
+                            triangles: solid(&indices),
+                            positions,
+                        }
+                    }
+                };
+                meshes.insert(building.path.clone(), mesh);
+            }
+            place(&meshes[&building.path], &building.matrix, &mut out);
+        }
+    }
+
+    // Doodads, from the triangles their batches draw.
+    let mut mask_ids: BTreeMap<String, Option<u32>> = BTreeMap::new();
+    let mut models: BTreeMap<String, Option<CasterMesh>> = BTreeMap::new();
+    for adt in adts {
+        for doodad in adt.placed_doodads() {
+            if !seen.insert(doodad.unique_id) {
+                continue;
+            }
+            if !models.contains_key(&doodad.path) {
+                let m2 = read(&doodad.path).and_then(|raw| crate::world::m2::M2::parse(&raw).ok());
+                let mesh = m2.map(|m2| {
+                    let mut triangles = Vec::new();
+                    let total = m2.indices.len() / 3;
+                    for batch in &m2.batches {
+                        let mask = match (cut_out, batch.blend) {
+                            (true, 1..) => batch
+                                .texture
+                                .and_then(|t| m2.textures.get(t as usize))
+                                .filter(|t| !t.file_name.is_empty())
+                                .and_then(|t| {
+                                    *mask_ids
+                                        .entry(t.file_name.to_ascii_lowercase())
+                                        .or_insert_with(|| alpha_mask(&mut read, &t.file_name, &mut out.masks))
+                                }),
+                            _ => None,
+                        };
+                        let first = batch.index_start as usize / 3;
+                        let last = (first + batch.index_count as usize / 3).min(total);
+                        for t in first..last {
+                            let c = [0, 1, 2].map(|k| u32::from(m2.indices[t * 3 + k]));
+                            let cutout = mask.map(|mask| Cutout {
+                                mask,
+                                uvs: c.map(|i| m2.uvs.get(i as usize).copied().unwrap_or_default()),
+                            });
+                            triangles.push((c, cutout));
+                        }
+                    }
+                    CasterMesh {
+                        positions: m2.positions,
+                        triangles,
+                    }
+                });
+                models.insert(doodad.path.clone(), mesh);
+            }
+            if let Some(Some(mesh)) = models.get(&doodad.path) {
+                place(mesh, &doodad.matrix, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// A texture's alpha channel added to `masks`, and its index. `None` for a
+/// texture that does not read, or that has no transparent texel and so casts
+/// solid.
+fn alpha_mask(
+    read: &mut impl FnMut(&str) -> Option<Vec<u8>>,
+    name: &str,
+    masks: &mut Vec<AlphaMask>,
+) -> Option<u32> {
+    let blp = crate::world::blp::decode(&read(name)?).ok()?;
+    let alpha: Vec<u8> = blp.rgba.chunks_exact(4).map(|p| p[3]).collect();
+    if alpha.iter().all(|&a| a == 255) {
+        return None;
+    }
+    masks.push(AlphaMask {
+        width: blp.width,
+        height: blp.height,
+        alpha,
+    });
+    Some(masks.len() as u32 - 1)
+}
+
 /// A model-space box's world-space box, through a placement matrix: the eight
 /// corners transformed and re-boxed.
 fn placed_box(bounds: [[f32; 3]; 2], matrix: &[f32; 16]) -> [[f32; 3]; 2] {
@@ -2267,9 +2485,9 @@ mod tests {
     use super::*;
     use crate::world::wmo;
 
-    /// vmangos' rule, spelled out: the `DETAIL` term is the one that is not
-    /// guessable, and dropping it doubles the hull in exactly the places that
-    /// are queried most.
+    /// vmangos' rule, case by case. The `DETAIL` term is the one that cannot be
+    /// inferred from the flag names, and dropping it doubles the hull in the
+    /// places that are queried most.
     #[test]
     fn a_detail_triangle_is_drawn_but_not_solid() {
         use wmo::mopy_flags::*;
@@ -2318,11 +2536,10 @@ mod tests {
         0.0, 0.0, 0.0, 1.0,
     ];
 
-    /// The overlay's own query is bounded and map-checked, which is the
-    /// whole of what makes it safe to run every frame: a radius that admits
-    /// everything is a frame that draws a million lines, and a hull left over
-    /// from the map before a teleport is a cage of triangles drawn around
-    /// nothing.
+    /// The overlay's query is bounded by radius and checked against the map,
+    /// which makes it safe to run every frame. A radius that admits everything
+    /// draws a million lines in one frame, and a hull left over from the map
+    /// before a teleport draws triangles where nothing stands.
     #[test]
     fn hulls_near_is_bounded_by_its_radius_and_by_the_map() {
         let world = CollisionWorld::new();
@@ -2358,7 +2575,7 @@ mod tests {
         assert_eq!(count(0, [5.0, 5.0, 5.0], 20.0), 1);
         // Widen far enough to reach the other and both come back.
         assert_eq!(count(0, [5.0, 5.0, 5.0], 120.0), 2);
-        // …and nothing at all belongs to a map these hulls are not on.
+        // On a map these hulls are not on, nothing is returned.
         assert_eq!(count(1, [5.0, 5.0, 5.0], 120.0), 0);
     }
 
@@ -2370,10 +2587,10 @@ mod tests {
         assert_eq!(c.floor(5.0, 11.0, 100.0), None);
     }
 
-    /// The slope comes back off the winning triangle, which is what lets a
-    /// model stand square on a ramp inside a building rather than square on the
-    /// terrain under it — and what stops it leaning by one step of a staircase
-    /// while standing on the next.
+    /// The slope is taken from the triangle that supplied the height. That
+    /// lets a model stand aligned to a ramp inside a building rather than to
+    /// the terrain under it, and keeps it from leaning by one step of a
+    /// staircase while standing on the next.
     #[test]
     fn a_surface_answers_the_slope_of_the_triangle_it_took_the_height_from() {
         // Two decks: a flat one at z = 5 and a ramp above it rising in x.
@@ -2397,21 +2614,21 @@ mod tests {
         let (z, n) = sloped.surface(5.0, 5.0, 100.0).expect("over the ramp");
         assert!((z - 15.0).abs() < 1e-4, "{z}");
         // Rising one yard in z per yard in x: the normal leans back along -x at
-        // 45°, and it is oriented up whatever the file's winding, which a
-        // `BoundingTriangles` hull does not promise.
+        // 45°, and it points up whatever the file's winding, which a
+        // `BoundingTriangles` hull does not guarantee.
         let root_half = std::f32::consts::FRAC_1_SQRT_2;
         assert!(
             (n[0] + root_half).abs() < 1e-3 && n[1].abs() < 1e-3 && (n[2] - root_half).abs() < 1e-3,
             "{n:?}"
         );
-        // …and `floor` is the same answer with the slope dropped, which is the
-        // claim that the mover and the stance cannot pick different surfaces.
+        // `floor` returns the same height without the slope, so the mover and
+        // the stance cannot pick different surfaces.
         assert_eq!(sloped.floor(5.0, 5.0, 100.0), Some(z));
         assert_eq!(sloped.surface(-1.0, 5.0, 100.0), None);
     }
 
-    /// The ceiling is what keeps a character walking under a bridge from being
-    /// pulled onto its deck — the whole reason the query takes one.
+    /// The ceiling keeps a character walking under a bridge from being lifted
+    /// onto its deck, which is why the query takes one.
     #[test]
     fn a_surface_above_the_ceiling_is_not_the_one_stood_on() {
         let c = Collider::place(&flat_quad(5.0), &IDENTITY);
@@ -2419,8 +2636,8 @@ mod tests {
         assert_eq!(c.floor(5.0, 5.0, 5.0), Some(5.0));
     }
 
-    /// Two decks stacked: standing on the lower one must not answer with the
-    /// upper, and standing on the upper must not answer with the lower.
+    /// Two decks stacked: standing on the lower one must not return the upper,
+    /// and standing on the upper must not return the lower.
     #[test]
     fn the_highest_floor_below_the_ceiling_wins() {
         let mut mesh = flat_quad(0.0);
@@ -2434,17 +2651,17 @@ mod tests {
         assert_eq!(c.floor(5.0, 5.0, 6.0 + STEP_UP), Some(6.0));
     }
 
-    /// A wall projects to a sliver of zero area in XY. Answering for it would
-    /// stand the character on top of the wall they are walking beside.
+    /// A wall projects to zero area in XY. A height from it would stand the
+    /// character on top of the wall they are walking beside.
     #[test]
     fn a_vertical_face_is_never_a_floor() {
         let c = Collider::place(&wall(), &IDENTITY);
         assert_eq!(c.floor(5.0, 5.0, 100.0), None);
     }
 
-    /// The grid must not lose a triangle that spans many cells — a cathedral
-    /// floor is one such triangle, and losing it is a hole in the world that
-    /// only shows where nobody happens to walk.
+    /// The grid must not lose a triangle that spans many cells. A cathedral
+    /// floor can be one such triangle, and losing it from some cells leaves a
+    /// hole in the floor only in those cells, which is easy to miss in play.
     #[test]
     fn a_triangle_spanning_many_cells_is_found_from_all_of_them() {
         let mesh = CollisionMesh {
@@ -2474,14 +2691,12 @@ mod tests {
     }
 
     /// Every query rejects on [`Tile::boxes`] before it touches a hull, so a
-    /// box vector out of step with its hulls answers nothing is there.
+    /// box vector out of step with its hulls reports that nothing is there.
     ///
-    /// That is the failure this test exists for, and it is the bad kind: a
-    /// missed `boxes.push` does not panic and does not mis-answer loudly — it
-    /// makes a building stop being solid, which reads as a collision bug
-    /// anywhere except here. The three queries are asked of the last hull
-    /// inserted, because a length mismatch always drops the tail: `zip` stops
-    /// at the shorter side.
+    /// A missed `boxes.push` does not panic or produce an obvious error: it
+    /// makes a building stop being solid, which elsewhere looks like a general
+    /// collision bug. The queries test the last hull inserted, because a
+    /// length mismatch always drops the tail: `zip` stops at the shorter side.
     #[test]
     fn every_hull_keeps_its_box_and_stays_answerable() {
         let world = CollisionWorld::new();
@@ -2509,8 +2724,8 @@ mod tests {
                 assert_eq!(*bounds, collider.bounds(), "a box that is not its hull's");
             }
         }
-        // The tenth floor: reachable by the point query, by the segment query,
-        // and — a wall this time — by the stride.
+        // The tenth floor: reachable by the point query and by the segment
+        // query.
         assert_eq!(world.floor(0, 185.0, 5.0, 100.0), Some(9.0));
         assert!(
             world.ray(0, [185.0, 5.0, 20.0], [185.0, 5.0, 0.0]).is_some(),
@@ -2518,14 +2733,14 @@ mod tests {
         );
     }
 
-    /// A ray narrowed to one population is answered by that population and by
-    /// nothing else, and the three kinds are told apart.
+    /// A ray narrowed to one population hits that population and nothing
+    /// else, and the three populations are told apart.
     ///
-    /// The failure this pins is silent in both directions. A filter that
-    /// admitted too much would stand something on the roof of a building that
-    /// is switched off — invisible, and only found later. A filter that
-    /// admitted too little would answer nothing and drop the same thing to the
-    /// terrain under the roof, which is the fault it was written to fix.
+    /// Both failure directions are silent. A filter that admitted too much
+    /// would stand something on the roof of a hidden building, out of sight.
+    /// A filter that admitted too little would hit nothing and drop the object
+    /// to the terrain under a visible roof, the fault the filter was added to
+    /// fix.
     #[test]
     fn a_ray_can_be_narrowed_to_one_population() {
         let world = CollisionWorld::new();
@@ -2564,7 +2779,7 @@ mod tests {
             Some(Arc::new(Collider::place(&object, &IDENTITY))),
         );
 
-        // Straight down onto each of the three, asked for each of the three.
+        // Straight down onto each of the three, with each filter.
         let down = |x: f32, want: Surfaces| world.ray_of(0, [x, 5.0, 20.0], [x, 5.0, 0.0], want);
         for (x, kind) in [
             (5.0, Solid::Building),
@@ -2581,8 +2796,8 @@ mod tests {
                 down(x, Surfaces::ALL).is_some(),
                 "{kind:?} did not answer for everything"
             );
-            // …and every filter that leaves this population out answers nothing
-            // over it, which is the half that cannot be spotted from a picture.
+            // Every filter that leaves this population out hits nothing over
+            // it. This half of the check cannot be seen in a screenshot.
             let others = Surfaces {
                 buildings: !only.buildings,
                 doodads: !only.doodads,
@@ -2605,8 +2820,8 @@ mod tests {
         assert!((end[1] - 9.0).abs() < 1.0e-3, "y stopped at {}", end[1]);
     }
 
-    /// The diagonal case is the one that decides whether a character walks
-    /// along a wall or sticks to it.
+    /// The diagonal case decides whether a character slides along a wall or
+    /// sticks to it.
     #[test]
     fn a_stride_at_an_angle_slides_along_the_wall() {
         let world = world_with(&wall());
@@ -2616,16 +2831,14 @@ mod tests {
     }
 
     /// A post the character's shoulder would hit stops the stride, even
-    /// though nothing at all is ahead of their centre.
+    /// though nothing is ahead of their centre.
     ///
-    /// The report is *"it is extremely easy to clip through doodads"*, and this
-    /// is its shape. The probe used to be one ray up the middle, so a stride
-    /// that passed a tree trunk, a fence post or a door jamb half a yard to the
-    /// side met nothing and went straight through it. A character is a yard
-    /// wide; the sweep is three lanes.
+    /// With a single centre ray, a stride that passes a tree trunk, a fence
+    /// post or a door jamb half a yard to the side meets nothing and goes
+    /// through it. A character is a yard wide, and the sweep has three lanes.
     ///
-    /// The post here spans `y` from 0.4 to 0.8 — clear of the centre line at
-    /// `y = 0` by 0.4 yards, and well inside the body.
+    /// The post spans `y` from 0.4 to 0.8: 0.4 yards clear of the centre line
+    /// at `y = 0`, and inside the body.
     #[test]
     fn a_post_beside_the_centre_line_still_stops_a_stride() {
         let post = CollisionMesh {
@@ -2648,14 +2861,16 @@ mod tests {
             "walked to {} straight through a post beside the centre line",
             end[0],
         );
-        // …and the same stride two yards further from it is not blocked, or the
-        // assertion above would be satisfied by a sweep that refuses anything.
+        // The same stride two yards further away is not blocked. Without this
+        // check, a sweep that blocks every stride would pass the assertion
+        // above.
         let end = world.step(0, [3.0, -2.0, 0.0], [7.0, -2.0, 0.0]);
         assert!((end[0] - 7.0).abs() < 1.0e-3, "a clear stride stopped at {}", end[0]);
     }
 
     /// Motion is cancelled, never reversed. A character who ends up inside
-    /// geometry — a teleport, a server correction — must be able to walk out.
+    /// geometry (after a teleport or a server correction) must be able to walk
+    /// out.
     #[test]
     fn a_stride_away_from_a_wall_is_never_blocked() {
         let world = world_with(&wall());
@@ -2663,12 +2878,12 @@ mod tests {
         assert!((end[0] - 1.0).abs() < 1.0e-3, "x stopped at {}", end[0]);
     }
 
-    /// **A run along a wall at a shallow angle never crosses it**, at any
-    /// stride length the mover produces and at a whole 250 ms mounted stride.
+    /// A run along a wall at a shallow angle never crosses it, at any stride
+    /// length the mover produces and at a whole 250 ms mounted stride.
     ///
     /// Each stride is swept along its whole length and half a yard beyond, so
-    /// the wall is met before the stride reaches it however long the stride is
-    /// and however shallow the angle. The strides are the session's run and
+    /// the wall is met before the stride reaches it for any stride length and
+    /// any angle. The strides are the session's run and
     /// mounted ticks (0.175 and 0.35 yards), the mover's longest piece (0.5),
     /// and an unbroken mounted stall (3.5).
     #[test]
@@ -2696,8 +2911,9 @@ mod tests {
         }
     }
 
-    /// The reason the probes start above [`STEP_UP`]: a stair riser is a wall,
-    /// and stopping at one is stopping at the bottom of every staircase.
+    /// The probes start above [`STEP_UP`] because a stair riser is a wall, and
+    /// a probe that stops at one stops the character at the bottom of every
+    /// staircase.
     #[test]
     fn a_step_shorter_than_the_probes_does_not_block() {
         let riser = CollisionMesh {
@@ -2716,8 +2932,9 @@ mod tests {
         assert!((end[0] - 6.0).abs() < 1.0e-3, "stopped on a kerb at {}", end[0]);
     }
 
-    /// A far teleport lands on tile coordinates that exist on the new map too.
-    /// Answering from the old map's buildings would be a wall in a field.
+    /// A far teleport lands on tile coordinates that also exist on the new
+    /// map. Answering from the old map's buildings would put invisible walls
+    /// on the new one.
     #[test]
     fn another_map_is_never_answered_for() {
         let world = world_with(&flat_quad(5.0));
@@ -2745,7 +2962,7 @@ mod tests {
     }
 
     /// The same building placed on two neighbouring tiles carries one id, and
-    /// two copies of one hull is two of every query's work for nothing.
+    /// two copies of one hull double every query's work.
     #[test]
     fn the_same_placement_is_not_held_twice() {
         let world = world_with(&flat_quad(5.0));
@@ -2759,10 +2976,10 @@ mod tests {
         assert_eq!(world.counts().0, 1);
     }
 
-    /// …and the reason the id is not a bare `u32`: every `MODD` spawn inside a
-    /// building carries the building's unique id, so a thousand chairs would
-    /// dedup down to one chair and the rest of the furniture would be walked
-    /// through. Three spawns of one placement are three hulls.
+    /// The id is not a bare `u32` because every `MODD` spawn inside a building
+    /// carries the building's unique id, so a thousand chairs would dedup to
+    /// one chair and the character would walk through the rest of the
+    /// furniture. Three spawns of one placement are three hulls.
     #[test]
     fn furniture_sharing_its_buildings_id_is_still_three_pieces_of_furniture() {
         let world = world_with(&flat_quad(5.0));
@@ -2776,16 +2993,16 @@ mod tests {
             );
         }
         assert_eq!(world.counts().0, 4, "the building and its three spawns");
-        // And a spawn ordinal never collides with the placement itself, which
-        // is what the 1-based numbering is for.
+        // A spawn ordinal never collides with the placement itself; the
+        // 1-based numbering ensures that.
         assert_ne!(SolidId::spawn(1, 0), SolidId::placement(1));
     }
 
     /// A hull nowhere near the stride must be rejected before any of its
     /// triangles is ray-tested. [`Collider::cell_of`] clamps, so without an
-    /// XY test a distant collider resolves to its nearest corner cell and pays
-    /// for every triangle in it — which is nothing across forty buildings and
-    /// the whole frame across a forest.
+    /// XY test a distant collider resolves to its nearest corner cell and
+    /// tests every triangle in it. That is negligible across forty buildings
+    /// and takes the whole frame across a forest.
     #[test]
     fn a_hull_far_from_the_stride_is_rejected_without_touching_a_triangle() {
         let c = Collider::place(&wall(), &IDENTITY);
@@ -2794,12 +3011,12 @@ mod tests {
         // The same ray a hundred yards away in Y, which clamps to the same
         // corner cell and would otherwise test the same two triangles.
         assert!(c.wall([3.0, 105.0, 2.0], [1.0, 0.0, 0.0], 4.0).is_none());
-        // …and one that stops short of the wall in X.
+        // A ray that stops short of the wall in X.
         assert!(c.wall([-50.0, 5.0, 2.0], [1.0, 0.0, 0.0], 4.0).is_none());
     }
 
     /// The hull is built from `MOPY` and the raw index buffer, not from the
-    /// draw list — so a group with no batches at all still contributes.
+    /// draw list, so a group with no batches still contributes.
     #[test]
     fn a_group_with_no_batches_still_has_collision() {
         let group = WmoGroup {
@@ -2823,7 +3040,7 @@ mod tests {
         let mesh = CollisionMesh::build(std::slice::from_ref(&group));
         assert_eq!(mesh.triangle_count(), 1);
 
-        // …and the two groups vmangos drops are dropped.
+        // The two group types vmangos drops are dropped.
         let mut antiportal = group.clone();
         antiportal.flags = wmo::group_flags::ANTIPORTAL;
         assert_eq!(CollisionMesh::build(&[antiportal]).triangle_count(), 0);
@@ -2832,9 +3049,9 @@ mod tests {
         assert_eq!(CollisionMesh::build(&[unreachable]).triangle_count(), 0);
     }
 
-    /// The placement matrix is the one thing here that could be silently wrong
-    /// in a way no count would show, so it is checked against a rotation whose
-    /// answer is known by hand: a 90° yaw about Z.
+    /// An error in the placement matrix would not show in any triangle count,
+    /// so it is checked against a rotation with a known result: a 90° yaw
+    /// about Z.
     #[test]
     fn a_hull_is_placed_through_the_same_matrix_the_geometry_is() {
         let matrix = crate::world::adt::placement_matrix([100.0, 200.0, 5.0], [0.0, 90.0, 0.0], 1.0);
@@ -2849,20 +3066,20 @@ mod tests {
         assert!((origin[0] - 100.0).abs() < 1.0e-4, "{origin:?}");
         assert!((origin[1] - 200.0).abs() < 1.0e-4, "{origin:?}");
         assert!((origin[2] - 5.0).abs() < 1.0e-4, "{origin:?}");
-        // The rotation is a rotation: distances from the placement's own origin
-        // survive it, whatever the axes turn out to be.
+        // A rotation preserves distances from the placement's origin,
+        // whichever axes it maps to which.
         for corner in &placed.positions[1..] {
             let d = sub(*corner, origin);
             assert!((dot(d, d).sqrt() - 1.0).abs() < 1.0e-4, "{corner:?}");
         }
     }
-    /// A placement is settled when its hull lands, and a placement with no
-    /// hull has to say so.
+    /// A placement is settled when its hull arrives, and a placement with no
+    /// hull must be settled explicitly.
     ///
-    /// The reader is `Standing::floor`, which refuses to stand on the ground
-    /// under a `MODF` box it has no answer for — so both halves of this are the
-    /// difference between a character waiting a moment for Stormwind and a
-    /// character hovering inside a hull-less building for ever.
+    /// The reader is `Standing::floor`, which does not stand a character on
+    /// the ground under an unsettled `MODF` box. With both paths working, a
+    /// character waits a moment for Stormwind's hull; with the second missing,
+    /// a character inside a hull-less building hovers for ever.
     #[test]
     fn a_placement_is_settled_by_its_hull_or_by_being_told_it_has_none() {
         let world = CollisionWorld::new();
@@ -2878,20 +3095,20 @@ mod tests {
         assert!(world.settled(0, 41), "a hull settles its own placement");
 
         // The other path: a building whose file carries no
-        // `BoundingTriangles` at all. It never inserts, so `ids` will never
-        // hold it and the answer has to come from somewhere else.
+        // `BoundingTriangles`. It never inserts, so `ids` never holds it and
+        // it must be settled with `settle`.
         assert!(!world.settled(0, 42));
         world.settle(0, (32, 48), 42);
         assert!(world.settled(0, 42));
 
-        // Asked across the resident tiles, not at one coordinate: a
-        // building is claimed by the tile its origin stands on and the
-        // character under it is often on the next tile along.
+        // Checked across the resident tiles, not at one coordinate: a
+        // building belongs to the tile its origin stands on and the
+        // character under it is often on the next tile.
         world.settle(0, (31, 48), 43);
         assert!(world.settled(0, 43));
 
-        // A different map is a different world, and a stale "settled" there
-        // would let a character stand on the wrong continent's ground.
+        // Settled marks are per map. A mark carried over from another map
+        // would be applied to the wrong continent's ground.
         assert!(!world.settled(1, 41));
         world.settle(1, (32, 48), 99);
         assert!(!world.settled(1, 41), "the map change dropped the old tiles");
@@ -2908,10 +3125,10 @@ mod tests {
     }
 
     /// The same id inserted again is the same placement placed again, and
-    /// the new hull stands in for the old one rather than being ignored. A
-    /// caller that rewrote a tile re-reads it after a move, and mints an undone
-    /// placement's id again; either left the old hull in place and the new
-    /// position without one.
+    /// the new hull replaces the old one rather than being ignored. A caller
+    /// that rewrote a tile re-reads it after a move, and mints an undone
+    /// placement's id again; ignoring either insert would leave the old hull
+    /// in place and the new position without one.
     #[test]
     fn a_second_insert_of_the_same_id_replaces_the_hull() {
         let world = CollisionWorld::new();
@@ -2935,8 +3152,8 @@ mod tests {
         assert_eq!(world.floor(0, 1.0, 1.0, 7.0), None, "and the old one is gone");
     }
 
-    /// A moved placement takes every hull that carries its id with it: the
-    /// building's own and its furniture's, and nobody else's.
+    /// A moved placement moves every hull that carries its id: the building's
+    /// own and its furniture's, and no other.
     #[test]
     fn a_moved_placement_takes_its_hulls_with_it() {
         let world = CollisionWorld::new();
@@ -2979,7 +3196,7 @@ mod tests {
         assert!(!world.settled(0, 42));
     }
 
-    // -- the ones the server places ----------------------------------------
+    // -- game objects the server places ------------------------------------
 
     fn placed_at(x: f32, y: f32) -> ObjectPlacement {
         ObjectPlacement {
@@ -2989,14 +3206,12 @@ mod tests {
         }
     }
 
-    /// The report this exists for: a closed door stops a stride, and the
-    /// same door standing open does not.
+    /// A closed door stops a stride, and the same door standing open does not.
     ///
-    /// Both halves matter and only one of them is the obvious one. A hull that
-    /// never arrives is a door you walk through, which is what was reported; a
-    /// hull that never leaves is a door that opens on screen and goes on
-    /// blocking the corridor, which is worse, because nothing about it looks
-    /// like a bug from the outside.
+    /// Both halves are tested. A hull that never arrives is a door the
+    /// character walks through. A hull that never leaves is a door that opens
+    /// on screen and still blocks the corridor, which is harder to recognise
+    /// as a bug.
     #[test]
     fn a_closed_game_object_blocks_a_stride_and_an_open_one_does_not() {
         let world = CollisionWorld::new();
@@ -3013,8 +3228,8 @@ mod tests {
         let blocked = world.step(0, from, [8.0, 5.0, 0.0]);
         assert!(blocked[0] < 5.0, "walked through the door: {blocked:?}");
 
-        // …and it is the floor query's hulls too, not a second population:
-        // a portcullis lying flat is something to stand on.
+        // Game object hulls also answer the floor query: a portcullis lying
+        // flat can be stood on.
         world.place_object(
             0,
             0x0F00_0000_0000_0002,
@@ -3024,8 +3239,8 @@ mod tests {
         assert_eq!(world.floor(0, 5.0, 5.0, 100.0), Some(5.0));
 
         // The door opens: the caller stops naming it, and the stride goes
-        // through. The flat one is still named, so this is the door leaving and
-        // not the whole population being dropped.
+        // through. The flat one is still named, which shows that only the door
+        // was removed and not every game object.
         let live: HashSet<u64> = [0x0F00_0000_0000_0002].into_iter().collect();
         world.retain_objects(&live);
         assert_eq!(world.step(0, from, [8.0, 5.0, 0.0]), [8.0, 5.0, 0.0]);
@@ -3036,10 +3251,10 @@ mod tests {
     /// A game object with no `BoundingTriangles` is decided about, not
     /// pending.
     ///
-    /// Without this the caller cannot tell "I have never looked at this
-    /// campfire" from "I looked and it has nothing solid in it", so it re-reads
-    /// the M2 and re-places a hull of nothing once per frame, per campfire, for
-    /// as long as one is in view.
+    /// Without this the caller cannot tell a campfire it has not examined from
+    /// one it examined and found nothing solid in, so it re-reads the M2 and
+    /// re-places an empty hull once per frame, per campfire, for as long as one
+    /// is in view.
     #[test]
     fn an_object_with_no_hull_is_a_finished_answer_rather_than_a_pending_one() {
         let world = CollisionWorld::new();
@@ -3050,14 +3265,14 @@ mod tests {
         assert_eq!(world.object_placement(0, fire), Some(placed_at(1.0, 2.0)));
         assert_eq!(world.counts().0, 0, "nothing solid was added");
 
-        // …and it is still dropped by name when it goes out of view, which a
-        // record that only tracked hulls could not do.
+        // It is still dropped by GUID when it goes out of view, which a record
+        // that only tracked hulls could not do.
         world.retain_objects(&HashSet::new());
         assert_eq!(world.object_placement(0, fire), None);
     }
 
-    /// A game object that moves — the placement is the caller's test for
-    /// whether the hull it holds is still the right one.
+    /// A game object that moves. The caller compares the placement to decide
+    /// whether the hull it holds is current.
     #[test]
     fn a_moved_object_replaces_its_hull_rather_than_gaining_a_second() {
         let world = CollisionWorld::new();
@@ -3072,22 +3287,23 @@ mod tests {
         assert_eq!(world.counts().0, 1, "the old hull is gone, not shadowed");
         assert_eq!(world.object_placement(0, gate), Some(placed_at(3.0, 0.0)));
 
-        // …and a hull that becomes no hull takes the old one with it, which is
-        // the shape of a display id changing under a game object.
+        // Placing it again with no hull removes the old hull. This is what
+        // happens when a game object's display id changes to a model with no
+        // collision.
         world.place_object(0, gate, placed_at(3.0, 0.0), None);
         assert_eq!(world.counts().0, 0);
     }
 
-    /// `swap_remove` keeps three vectors and an index in step, and the failure
-    /// mode is silent: the hull left behind answers to the wrong GUID, so the
-    /// next door to open removes somebody else's wall.
+    /// `swap_remove` must keep three vectors and an index in step, and a
+    /// mistake is silent: the hull left behind is filed under the wrong GUID,
+    /// so the next door to open removes another object's wall.
     #[test]
     fn removing_one_of_several_objects_leaves_the_rest_answerable() {
         let world = CollisionWorld::new();
         let guids = [10_u64, 11, 12, 13];
         for (n, guid) in guids.iter().enumerate() {
-            // Four walls at x = 5, 15, 25, 35 — one per object, so which hull
-            // survives is visible in the answer rather than only in the count.
+            // Four walls at x = 5, 15, 25, 35, one per object, so which hulls
+            // survive is visible in the query results and not only the count.
             let matrix = object_matrix([n as f32 * 10.0, 0.0, 0.0], 0.0, 1.0);
             world.place_object(
                 0,
@@ -3098,7 +3314,7 @@ mod tests {
         }
         assert_eq!(world.counts().0, 4);
 
-        // Drop the first and the third — the two that force a swap into a hole
+        // Drop the first and the third, the two that force a swap into a hole
         // that is not the last slot.
         let live: HashSet<u64> = [11_u64, 13].into_iter().collect();
         world.retain_objects(&live);
@@ -3111,8 +3327,8 @@ mod tests {
         assert!(blocked(35.0), "guid 13 was kept and its wall went");
     }
 
-    /// A game object is keyed to a map exactly as a placement is: a door in the
-    /// Deadmines must not still be standing in the middle of Elwynn.
+    /// A game object is keyed to a map as a placement is: a door in the
+    /// Deadmines must not remain as a hull in Elwynn.
     #[test]
     fn a_map_change_takes_the_game_objects_with_it() {
         let world = CollisionWorld::new();
@@ -3134,10 +3350,9 @@ mod tests {
     /// `GO_STATE_READY` is the only solid state, and an absent field is
     /// `GO_STATE_ACTIVE`.
     ///
-    /// The second half is the one that would be got backwards: vmangos omits a
-    /// zero field from a create block, so silence means open, and a client
-    /// that read it as "unknown, assume shut" would wall off every door in the
-    /// game that was standing open when it came into view.
+    /// vmangos omits a zero field from a create block, so an absent state means
+    /// open. A client that treated it as unknown and assumed shut would block
+    /// every door that was open when it came into view.
     #[test]
     fn only_the_ready_state_is_solid() {
         assert!(game_object_is_solid(Some(GO_STATE_READY)));
@@ -3146,28 +3361,27 @@ mod tests {
         assert!(!game_object_is_solid(None), "an absent field is zero");
     }
 
-    /// The server's matrix is a turn about up and nothing else, and it
-    /// carries no 180° term.
+    /// The server's matrix is a rotation about +Z only, with no 180° term.
     ///
-    /// Both halves fail plausibly. A stray `Rz(pi)` — copied from
-    /// `adt::placement_matrix`, where it is right — puts a door's hull on the
-    /// other side of its own hinge, which is a door you walk through in one
-    /// direction and bounce off a yard early in the other. A rotation taken the
-    /// wrong way round is invisible on a symmetric gate and obvious on nothing
-    /// at all.
+    /// Both errors are easy to miss. A stray `Rz(pi)`, copied from
+    /// `adt::placement_matrix` where it is correct, puts a door's hull on the
+    /// other side of its hinge: the character walks through the door from one
+    /// side and stops a yard early from the other. A rotation in the wrong
+    /// direction does not show on a symmetric gate and is hard to spot on
+    /// anything else.
     #[test]
     fn a_server_placed_hull_turns_about_up_and_nothing_else() {
-        // Facing zero is the identity but for the translation.
+        // Facing zero is the identity apart from the translation.
         let m = object_matrix([100.0, 200.0, 300.0], 0.0, 1.0);
         let moved = transform_point(&m, [1.0, 2.0, 3.0]);
         assert_eq!(moved, [101.0, 202.0, 303.0]);
 
-        // A quarter turn counter-clockwise takes north (+X) to west (+Y), which
-        // is the server's own convention and the renderer's.
+        // A quarter turn counter-clockwise takes north (+X) to west (+Y), the
+        // convention of both the server and the renderer.
         let m = object_matrix([0.0, 0.0, 0.0], std::f32::consts::FRAC_PI_2, 1.0);
         let north = transform_point(&m, [1.0, 0.0, 0.0]);
         assert!(north[0].abs() < 1e-6 && (north[1] - 1.0).abs() < 1e-6, "{north:?}");
-        // …and up stays up: no pitch, no roll, whatever the facing.
+        // +Z is unchanged: no pitch and no roll, whatever the facing.
         let up = transform_point(&m, [0.0, 0.0, 1.0]);
         assert!((up[2] - 1.0).abs() < 1e-6 && up[0].abs() < 1e-6 && up[1].abs() < 1e-6);
 
@@ -3186,8 +3400,8 @@ mod ground_ray_tests {
         Some(0.0)
     }
 
-    /// The straightforward case: an eye above the ground, pointing down and
-    /// north, lands where the arithmetic says it does.
+    /// An eye above the ground, pointing down and north, lands at the
+    /// computed crossing.
     #[test]
     fn a_ray_lands_on_the_floor_it_is_pointed_at() {
         // 10 up, aimed 45 degrees down along +X (north): the crossing is at
@@ -3196,24 +3410,24 @@ mod ground_ray_tests {
             .expect("a ray aimed at the ground hits it");
         assert!((hit[0] - 10.0).abs() < 0.05, "{hit:?}");
         assert!(hit[1].abs() < 1.0e-4, "{hit:?}");
-        // …and the z is the floor's, not the ray's.
+        // The z is the floor's, not the ray's.
         assert!(hit[2].abs() < 1.0e-4, "{hit:?}");
     }
 
-    /// A pointer aimed at the sky answers nothing, which is what stands the
-    /// placement cursor down rather than casting at the horizon.
+    /// A pointer aimed at the sky returns `None`, which hides the placement
+    /// cursor rather than casting at the horizon.
     #[test]
     fn a_ray_that_never_reaches_the_floor_answers_nothing() {
         assert_eq!(ground_under_ray([0.0, 0.0, 10.0], [1.0, 0.0, 0.1], 100.0, flat), None);
-        // …and so does one whose reach runs out first: level with the ground at
-        // a shallow angle, 5 yards of it is not enough to descend 10.
+        // So does a ray whose reach runs out first: 5 yards along it is not
+        // enough to descend 10.
         assert_eq!(ground_under_ray([0.0, 0.0, 10.0], [1.0, 0.0, -1.0], 5.0, flat), None);
     }
 
-    /// A slope is met where it actually is, which is the case a single
-    /// height sample under the pointer would get wrong: the floor here rises
-    /// north at 45 degrees, so a ray descending at 45 degrees meets it halfway
-    /// to where a flat floor would have taken it.
+    /// A slope is met at its true position, which a single height sample under
+    /// the pointer would get wrong. The floor here rises north at 45 degrees,
+    /// so a ray descending at 45 degrees meets it halfway to where it would
+    /// meet a flat floor.
     #[test]
     fn the_crossing_follows_the_slope_rather_than_the_sample_grid() {
         let slope = |x: f32, _y: f32, _z: f32| Some(x);
@@ -3223,8 +3437,8 @@ mod ground_ray_tests {
         assert!((hit[2] - 5.0).abs() < 0.05, "{hit:?}");
     }
 
-    /// A hole in the terrain is not a floor, so the walk goes past it — and
-    /// what it lands on is the ground on the far side rather than the near edge.
+    /// A hole in the terrain is not a floor, so the walk continues past it and
+    /// lands on the ground on the far side rather than the near edge.
     #[test]
     fn a_column_with_no_floor_under_it_ends_nothing() {
         let holed = |x: f32, _y: f32, _z: f32| (!(4.0..8.0).contains(&x)).then_some(0.0);
@@ -3233,8 +3447,8 @@ mod ground_ray_tests {
         assert!(hit[0] >= 8.0, "landed inside the hole: {hit:?}");
     }
 
-    /// A camera that has been pushed inside a hillside answers at its own
-    /// origin, rather than walking on and pointing at whatever is beyond it.
+    /// A camera inside a hillside returns its own origin, rather than marching
+    /// on and pointing at whatever is beyond the hill.
     #[test]
     fn a_ray_that_starts_underground_answers_where_it_starts() {
         let hit = ground_under_ray([3.0, 4.0, -2.0], [1.0, 0.0, -1.0], 100.0, flat)
@@ -3243,7 +3457,7 @@ mod ground_ray_tests {
         assert!((hit[1] - 4.0).abs() < 1.0e-4, "{hit:?}");
     }
 
-    /// Degenerate inputs answer nothing rather than looping or dividing by zero.
+    /// Degenerate inputs return `None` rather than looping or dividing by zero.
     #[test]
     fn a_ray_with_no_direction_or_no_reach_answers_nothing() {
         assert_eq!(ground_under_ray([0.0, 0.0, 10.0], [0.0, 0.0, 0.0], 100.0, flat), None);
@@ -3259,13 +3473,13 @@ mod ground_ray_tests {
 mod group_tests {
     use super::*;
 
-    /// The floor a point stands on answers with its own group's flags,
-    /// and a roof over it does not.
+    /// The floor a point stands on returns its own group's flags, not those of
+    /// a roof over it.
     ///
     /// Two groups, stacked: a street at z = 0 flagged outdoor and a room's
     /// floor at z = 6 inside the same building. A probe at z = 1 is on the
-    /// street, a probe at z = 7 is in the room, and the street's answer must
-    /// not leak to the room above it or the other way round.
+    /// street and a probe at z = 7 is in the room, and neither may return the
+    /// other's flags.
     #[test]
     fn a_building_floor_carries_the_flags_of_the_group_it_came_from() {
         let quad = |z: f32| {
@@ -3288,7 +3502,7 @@ mod group_tests {
         assert_eq!(collider.building_floor(5.0, 5.0, 7.0), Some((6.0, 0x2000)));
         assert_eq!(collider.building_floor(20.0, 5.0, 7.0), None, "off the hull");
 
-        // …and a hull with no groups — every M2's — answers nothing, so a crate
+        // A hull with no groups, as every M2's is, returns `None`, so a crate
         // on a street cannot turn the street into a room.
         let bare = CollisionMesh {
             triangle_groups: Vec::new(),

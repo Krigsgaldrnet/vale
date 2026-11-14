@@ -1,64 +1,76 @@
-//! `MCSH`, recomputed: what the world standing on a chunk throws across it.
+//! Recomputing a tile's `MCSH` shadow maps from what stands on it.
 //!
-//! ## This is the only shadow 1.12 has
+//! ## What `MCSH` is
 //!
-//! The reference client casts nothing at run time — no shadow map, no
-//! projection, nothing that moves with the sun. The shadows anyone remembers
-//! under Stormwind's walls are a 64x64 bitmap per chunk that Blizzard's tools
-//! baked once, at the same resolution and texel centres as an alpha map, drawn
-//! by darkening the sun term where the bit is set. `vale_assets::world::adt`
-//! is where that is written up and where the bits are read.
+//! The 1.12.1 client casts no shadows at run time. The ground's shadows are a
+//! 64x64 bitmap per chunk, baked offline, on the same texel grid as an alpha
+//! map, and drawn by darkening the sun term where a bit is set.
+//! `vale_assets::world::adt` reads the bits. An edit that moves ground or
+//! places a model leaves the old shadow in place until the tile is rebaked.
 //!
-//! Which means an editor that moves ground or places a building and does not
-//! touch `MCSH` leaves a shadow from the old world lying on the new one. It is
-//! the one thing in a tile that no other edit invalidates *visibly*: a raised
-//! hill keeps the shadow of the trees that used to stand beside it, and nothing
-//! reports anything.
+//! ## What the shipped maps were cast from
 //!
-//! ## The sun is fixed, and that is not a simplification
+//! `vale bake <Map> <x> <y> shadow` rebakes a tile under several occluders
+//! and scores each against the shipped map. The occluder that reproduces the
+//! shipped maps is:
 //!
-//! [`vale_assets::tables::light::SUN_TOWARD`] is a measured constant —
-//! azimuth 40°, elevation 40°, recovered from the shadows Blizzard baked by
-//! `vale sun`, which cross-correlates predicted canopy shadows against the
-//! real bitmap over five tiles. A bake has to agree with the bakes on the tiles
-//! beside it or the seam is a step in the shading, so the direction is not a
-//! setting: it is whatever the shipped tiles were baked under. It is an argument
-//! here rather than a constant only so that a caller can re-bake a whole map
-//! under a different sun if it ever wants to, and so that the tests can use one
-//! they can reason about.
+//! * each placed doodad's drawn triangles, with the triangles of every
+//!   non-opaque batch tested against the alpha of their texture
+//!   (`vale_assets::world::collision::shadow_casters_near`);
+//! * each placed building's collision hull. Its drawn triangles score the
+//!   same on the tiles measured and are ten times as many;
+//! * no terrain. Adding [`Ground`] lowers the score on every tile measured;
+//! * the tile and its eight neighbours, cut to [`casting_box`], since a
+//!   shadow crosses tile seams;
+//! * the sun at [`vale_assets::tables::light::SHADOW_SUN`], and a ray length
+//!   of [`REACH`].
 //!
-//! ## Where the geometry comes from, and why not from here
+//! ```text
+//!                                   texels agreeing   shipped shadow found
+//! Azeroth_32_49                          97.7%              99.8%
+//! Azeroth_34_51                          96.1%              99.5%
+//! Azeroth_31_49                          97.5%              99.5%
+//! Kalimdor_32_26                         98.9%             100.0%
+//! ```
 //!
-//! This crate opens no archives and builds no meshes — see the crate root. What
-//! casts a shadow is a doodad's `M2` and a building's `WMO`, which live in the
-//! MPQ chain, so the caller supplies the answer to the only question this needs:
-//! **is there anything between this point and the sun?** [`Occluder`] is that
-//! question and nothing else.
+//! Casting from collision hulls instead, as this module did before, finds
+//! 20.5% of the shipped shadow on `Azeroth_32_49`: a tree's hull is its trunk
+//! and a rough block for the crown.
 //!
-//! The caller decides what is in it, and **what the shipped files were baked
-//! from is doodads and buildings rather than the ground**: see [`Ground`], where
-//! the measurement that says so is. `vale_ide` puts the doodads and
-//! buildings of the tile *and its eight neighbours* in, cut to [`casting_box`],
-//! and leaves the terrain out. The neighbours are not optional: a building is
-//! recorded by the tile its origin stands on and a shadow does not stop at a
-//! seam, so a bake of the tile's own placements alone shadows a harbour on the
-//! tile it belongs to and on none of the tiles it stands across.
+//! What the rebake adds that the shipped map lacks is mostly a one- or
+//! two-texel fringe of leaf detail and the shadows of small doodads in open
+//! ground. What it misses is mostly chunks with holes, where there is no
+//! ground to sample.
+//!
+//! ## Where the geometry comes from
+//!
+//! This crate opens no archives. The caller supplies an [`Occluder`], which
+//! answers one question: is there anything between this point and the sun?
+//! [`Casters`] is the occluder for a set of triangles; the caller fills it
+//! from the archives.
 
 use crate::adt::file::{AdtFile, Region, SubChunk};
 use crate::adt::header::at;
 use crate::adt::heights;
+use vale_assets::world::collision::{AlphaMask, Cutout, ShadowCasters};
 use vale_assets::world::adt::{
     decode_shadow_map, encode_shadow_map, mcnk_flags, ALPHA_LEN, ALPHA_SIDE, CHUNKS_PER_SIDE, CHUNK_SIZE,
 };
 
-/// How far from the ground to look for something in the way, in yards.
+/// How far along a ray to look for something in the way, in yards.
 ///
-/// A shadow is only as long as the thing casting it: at the baked sun's 40° of
-/// elevation, a hundred-yard tower reaches about 120 yards and a fifteen-yard
-/// tree about eighteen. Two hundred covers every doodad in the game and the
-/// walls of every building, and it bounds the work — a ray is tested against
-/// every hull whose box it crosses, so the reach is the search radius.
-pub const REACH: f32 = 200.0;
+/// 800 yards along a ray at [`vale_assets::tables::light::SHADOW_SUN`]'s
+/// 46.7° is 549 yards across the ground, which is past the far edge of the
+/// neighbouring tiles, so every caster the bake is given is within reach.
+/// At 200 yards, `Kalimdor_32_26` misses 7% of its shipped shadow: the shadows
+/// of Ashenvale's tallest trees are longer than that.
+pub const REACH: f32 = 800.0;
+
+/// The texture alpha at or above which a cut-out triangle casts.
+///
+/// The score against the shipped maps changes by under 0.5% between 1 and
+/// 240, so this is the midpoint.
+pub const ALPHA_TEST: u8 = 128;
 
 /// How far above the ground a ray starts.
 ///
@@ -69,16 +81,15 @@ pub const REACH: f32 = 200.0;
 /// height.
 pub const LIFT: f32 = 0.1;
 
-/// **The box a tile's shadows are cast from**: the tile's own square widened
-/// by `reach` on every side, at every height.
+/// The box a tile's shadows are cast from: the tile's own square widened by
+/// `reach` on every side, at every height.
 ///
 /// A ray leaves a texel of the tile and travels `reach` at most, so nothing
-/// whose hull lies wholly outside this box can block one. It is what a caller
-/// hands `vale_assets::world::collision::hulls_near` to keep the
-/// neighbours' hulls to the ones that matter — and the neighbours *are*
-/// wanted: a building is placed by the tile its origin is on and its walls
-/// fall across the seam, so a bake fed only the tile's own file casts nothing
-/// from a harbour that stands half on it. See that function's note.
+/// wholly outside this box can block one. A caller passes it to
+/// `vale_assets::world::collision::shadow_casters_near` to keep the
+/// neighbouring tiles' placements to the ones that can matter. The neighbours
+/// are needed: a building is placed by the tile its origin is on, and its
+/// walls can stand across the seam.
 pub fn casting_box(tile_x: u32, tile_y: u32, reach: f32) -> [[f32; 3]; 2] {
     use vale_assets::world::adt::TILE_SIZE;
     let centre = vale_assets::world::terrain::tile_centre(tile_x, tile_y);
@@ -89,24 +100,18 @@ pub fn casting_box(tile_x: u32, tile_y: u32, reach: f32) -> [[f32; 3]; 2] {
     ]
 }
 
-/// **Is anything between this point and the sun?**
+/// Whether anything is between a point and the sun.
 ///
-/// The one thing a bake needs and the one thing this crate cannot answer. The
-/// caller builds it out of whatever it thinks casts a shadow — the tile's
-/// doodads, its buildings, the neighbours' where they overhang, and the terrain
-/// itself.
-///
-/// `from` is a point a little above the ground, `toward` is a unit vector at the
-/// sun, and `max` is how far to look.
+/// `from` is a point a little above the ground, `toward` is a unit vector at
+/// the sun, and `max` is how far to look.
 pub trait Occluder {
     fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool;
 }
 
 /// An occluder with nothing in it, which bakes an unshadowed tile.
 ///
-/// Useful on its own: it is what *clears* a tile's shadows, and it is what a
-/// caller that has not loaded any geometry yet should pass rather than skipping
-/// the bake and leaving the old bits.
+/// Baking with it clears a tile's shadows. A caller that has no geometry yet
+/// passes it rather than skipping the bake and leaving the old bits.
 pub struct Nothing;
 
 impl Occluder for Nothing {
@@ -124,59 +129,38 @@ where
     }
 }
 
-/// **The tile's own ground, as something that casts — which the shipped bakes
-/// appear not to have done.**
+/// The tile's own ground as an occluder: terrain shading terrain.
 ///
-/// This was added on the reasoning that terrain must shadow terrain, since
-/// `Azeroth_32_49` ships with 71% of its texels in shadow and no quantity of
-/// trees accounts for that. `vale bake` then measured it against the shipped
-/// files, both occluders over two tiles, and said otherwise:
+/// The shipped `MCSH` maps do not contain terrain self-shadow. With the
+/// casters described in the module header, adding this occluder lowers the
+/// share of texels that agree with the shipped map on every tile measured:
 ///
 /// ```text
-///                                     32 49        34 51
-/// shadow in the shipped file          70.9%        80.5%   <- the base rate
-/// precision of hull-cast shadow       98.5%        98.3%
-///   …as a multiple of the base rate   1.39x        1.22x
-/// precision of what the ground adds   29.8%        72.7%
-///   …as a multiple of the base rate   0.42x        0.90x
+///                     casters only   casters and ground
+/// Azeroth_32_49           97.7%            96.3%
+/// Azeroth_34_51           96.1%            95.1%
+/// Kalimdor_32_26          89.1%            89.1%   (at a 200-yard reach)
 /// ```
 ///
-/// A texel this marks at random would be right at the base rate. Hull-cast
-/// shadow is well *above* it on both tiles, which is what says the hulls land
-/// where the shipped shadow is. What the ground adds is at or below chance on
-/// both — so there is no evidence terrain self-shadow is in `MCSH` at all, and
-/// some evidence against.
+/// The client darkens a slope by its `MCNR` normal against the sun, so baking
+/// terrain shadow into `MCSH` as well would darken it twice. The editor leaves
+/// this out by default and offers it as an option for maps made for this
+/// client.
 ///
-/// That reading is consistent with what the client does: it already darkens a
-/// slope through `MCNR`'s own normal, so baking the same term into `MCSH` would
-/// darken it twice.
+/// ## How it is traced
 ///
-/// **So this is not in the default bake**, and a caller that wants it is asking
-/// for something the reference tiles do not have. It is kept because the
-/// measurement is worth being able to repeat, and because a map built for this
-/// client rather than for 1.12 may well want it.
+/// The ground is a height field, so a ray is marched: each step along the ray
+/// compares the ray's height with the ground's. The ground is sampled once
+/// onto a regular grid at the alpha map's resolution, 1024 samples across a
+/// tile, a little over half a yard apart, which is 1M height lookups and about
+/// a tenth of a second.
 ///
-/// ## A height field is marched, not ray-traced
+/// ## Limits
 ///
-/// The ground is a function of x and y rather than a soup of triangles, so the
-/// question *is anything between here and the sun* is answered by walking along
-/// the ray and asking whether the ground is above it yet. That is one array
-/// lookup per step against a triangle intersection per candidate, and at a
-/// million texels a tile the difference is minutes.
-///
-/// It is sampled onto a regular grid once, at the alpha map's own resolution —
-/// 1024 across a tile, a little over half a yard — because the alternative is a
-/// chunk search per step. Building it is 1M height lookups and about a tenth of
-/// a second.
-///
-/// ## What it does not have in it
-///
-/// **The neighbouring tiles.** A cliff on the tile next door throws a shadow
-/// across this one and this knows nothing about it, so a bake is wrong in a band
-/// along whichever edges have high ground beyond them. Fixing it means sampling
-/// nine tiles into one field, which is nine times the memory and the same code;
-/// it is not done because nothing has needed it yet, and it is written down here
-/// because the seam is exactly where somebody will notice it first.
+/// Only the tile's own ground is sampled. A cliff on a neighbouring tile casts
+/// nothing on this one, so a bake with this occluder is wrong in a band along
+/// any edge with high ground beyond it. Sampling the nine tiles into one field
+/// would fix it.
 pub struct Ground {
     /// Samples across the tile, in both axes.
     side: usize,
@@ -192,9 +176,8 @@ pub struct Ground {
 impl Ground {
     /// Sample a tile's ground onto a regular grid.
     ///
-    /// Taken before the bake rather than during it, which is not only about
-    /// speed: [`bake`] wants the tile mutably and this wants it shared, so the
-    /// two cannot both hold it.
+    /// Taken before the bake because [`bake`] holds the tile mutably and this
+    /// needs it shared.
     pub fn of(tile: &AdtFile) -> Ground {
         let side = CHUNKS_PER_SIDE * ALPHA_SIDE;
         let step = CHUNK_SIZE / ALPHA_SIDE as f32;
@@ -247,9 +230,8 @@ impl Ground {
 
 impl Occluder for Ground {
     fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
-        // A ray going down cannot be blocked by ground it is already above, and
-        // a ray straight up meets nothing. Neither happens with a real sun, and
-        // both would loop or divide badly.
+        // A level or descending ray is not tested: the sun is above the
+        // horizon, and such a ray would march without climbing.
         if toward[2] <= 0.0 {
             return false;
         }
@@ -259,8 +241,7 @@ impl Occluder for Ground {
             let y = from[1] + toward[1] * travelled;
             let z = from[2] + toward[2] * travelled;
             match self.at(x, y) {
-                // Off the tile: there is nothing more this can say, and
-                // marching on would sample the far edge for ever.
+                // Off the tile: no ground is known beyond it.
                 None => return false,
                 Some(ground) if ground > z => return true,
                 Some(_) => {}
@@ -271,9 +252,261 @@ impl Occluder for Ground {
     }
 }
 
-/// **Two occluders as one**, so a caller can put the ground and the buildings in
-/// the same bake without either knowing about the other.
-pub struct Either<'a>(pub &'a dyn Occluder, pub &'a dyn Occluder);
+/// World-space triangles that cast a shadow, bucketed on a grid over x and y.
+///
+/// A ray walks the grid cells its x and y cross, nearest first, and stops at
+/// the first triangle it meets. A cell is skipped when the ray is already above
+/// the highest triangle in it, and the walk stops when the ray is above every
+/// triangle. A tile with its neighbours' trees is a few million triangles,
+/// which this answers in about a second per million rays on one core.
+pub struct Casters {
+    triangles: Vec<[[f32; 3]; 3]>,
+    /// Parallel to `triangles`; see `vale_assets::world::collision::Cutout`.
+    cutouts: Vec<Option<Cutout>>,
+    masks: Vec<AlphaMask>,
+    /// The alpha at or above which a cut-out triangle casts.
+    threshold: u8,
+    /// The grid's minimum corner in x and y.
+    min: [f32; 2],
+    cols: usize,
+    rows: usize,
+    /// `starts[c]..starts[c + 1]` indexes `items` for cell `c = row * cols + col`.
+    starts: Vec<u32>,
+    /// Triangle indices, bucketed by cell.
+    items: Vec<u32>,
+    /// The highest z of any triangle in each cell, or `f32::MIN` for an empty one.
+    top: Vec<f32>,
+    /// The highest z of any triangle.
+    highest: f32,
+}
+
+impl Casters {
+    /// The side of a grid cell, in yards.
+    pub const CELL: f32 = 2.0;
+
+    /// Bucket `casters`. A cut-out triangle casts where its texel's alpha is
+    /// at least `threshold`.
+    pub fn new(casters: ShadowCasters, threshold: u8) -> Casters {
+        let ShadowCasters {
+            triangles,
+            mut cutouts,
+            masks,
+        } = casters;
+        cutouts.resize(triangles.len(), None);
+        let mut lo = [f32::MAX; 2];
+        let mut hi = [f32::MIN; 2];
+        let mut highest = f32::MIN;
+        for t in &triangles {
+            for v in t {
+                for axis in 0..2 {
+                    lo[axis] = lo[axis].min(v[axis]);
+                    hi[axis] = hi[axis].max(v[axis]);
+                }
+                highest = highest.max(v[2]);
+            }
+        }
+        if triangles.is_empty() {
+            lo = [0.0; 2];
+            hi = [0.0; 2];
+        }
+        let cols = (((hi[0] - lo[0]) / Self::CELL).floor() as usize + 1).max(1);
+        let rows = (((hi[1] - lo[1]) / Self::CELL).floor() as usize + 1).max(1);
+        let span = |t: &[[f32; 3]; 3]| {
+            let (mut a, mut b) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for v in t {
+                for axis in 0..2 {
+                    a[axis] = a[axis].min(v[axis]);
+                    b[axis] = b[axis].max(v[axis]);
+                }
+            }
+            let cell = |v: f32, axis: usize, n: usize| (((v - lo[axis]) / Self::CELL).floor().max(0.0) as usize).min(n - 1);
+            (cell(a[0], 0, cols), cell(b[0], 0, cols), cell(a[1], 1, rows), cell(b[1], 1, rows))
+        };
+
+        let mut counts = vec![0u32; cols * rows + 1];
+        for t in &triangles {
+            let (c0, c1, r0, r1) = span(t);
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    counts[r * cols + c] += 1;
+                }
+            }
+        }
+        let mut starts = vec![0u32; cols * rows + 1];
+        for c in 0..cols * rows {
+            starts[c + 1] = starts[c] + counts[c];
+        }
+        let mut fill = starts.clone();
+        let mut items = vec![0u32; starts[cols * rows] as usize];
+        let mut top = vec![f32::MIN; cols * rows];
+        for (index, t) in triangles.iter().enumerate() {
+            let z = t[0][2].max(t[1][2]).max(t[2][2]);
+            let (c0, c1, r0, r1) = span(t);
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    let cell = r * cols + c;
+                    items[fill[cell] as usize] = index as u32;
+                    fill[cell] += 1;
+                    top[cell] = top[cell].max(z);
+                }
+            }
+        }
+        Casters {
+            triangles,
+            cutouts,
+            masks,
+            threshold,
+            min: lo,
+            cols,
+            rows,
+            starts,
+            items,
+            top,
+            highest,
+        }
+    }
+
+    /// How many triangles cast.
+    pub fn len(&self) -> usize {
+        self.triangles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.triangles.is_empty()
+    }
+
+    /// Whether the ray meets any triangle in one cell between `0` and `max`.
+    fn hits_in(&self, cell: usize, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
+        let range = self.starts[cell] as usize..self.starts[cell + 1] as usize;
+        self.items[range].iter().any(|&t| {
+            let Some((d, u, v)) = ray_meets(from, toward, &self.triangles[t as usize]) else {
+                return false;
+            };
+            if d > max {
+                return false;
+            }
+            match &self.cutouts[t as usize] {
+                None => true,
+                Some(cut) => {
+                    let w = 1.0 - u - v;
+                    let uv = [
+                        w * cut.uvs[0][0] + u * cut.uvs[1][0] + v * cut.uvs[2][0],
+                        w * cut.uvs[0][1] + u * cut.uvs[1][1] + v * cut.uvs[2][1],
+                    ];
+                    self.masks
+                        .get(cut.mask as usize)
+                        .is_none_or(|m| m.at(uv) >= self.threshold)
+                }
+            }
+        })
+    }
+}
+
+impl Occluder for Casters {
+    fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
+        if self.triangles.is_empty() || from[2] > self.highest && toward[2] >= 0.0 {
+            return false;
+        }
+        let size = [self.cols as f32 * Self::CELL, self.rows as f32 * Self::CELL];
+        // Clip the ray to the grid's square.
+        let (mut enter, mut leave) = (0.0f32, max);
+        for axis in 0..2 {
+            let (o, d) = (from[axis] - self.min[axis], toward[axis]);
+            if d.abs() < 1.0e-9 {
+                if o < 0.0 || o >= size[axis] {
+                    return false;
+                }
+                continue;
+            }
+            let (a, b) = ((0.0 - o) / d, (size[axis] - o) / d);
+            enter = enter.max(a.min(b));
+            leave = leave.min(a.max(b));
+        }
+        if enter > leave {
+            return false;
+        }
+
+        // Walk the cells from `enter` to `leave`.
+        let at = |t: f32, axis: usize| from[axis] + toward[axis] * t - self.min[axis];
+        let n = [self.cols, self.rows];
+        let mut cell = [0usize; 2];
+        let mut step = [0isize; 2];
+        let mut next = [f32::MAX; 2];
+        let mut delta = [f32::MAX; 2];
+        for axis in 0..2 {
+            let p = at(enter, axis);
+            cell[axis] = ((p / Self::CELL).floor().max(0.0) as usize).min(n[axis] - 1);
+            let d = toward[axis];
+            if d > 1.0e-9 {
+                step[axis] = 1;
+                delta[axis] = Self::CELL / d;
+                next[axis] = enter + ((cell[axis] + 1) as f32 * Self::CELL - p) / d;
+            } else if d < -1.0e-9 {
+                step[axis] = -1;
+                delta[axis] = -Self::CELL / d;
+                next[axis] = enter + (cell[axis] as f32 * Self::CELL - p) / d;
+            }
+        }
+        let mut t = enter;
+        loop {
+            let exit = next[0].min(next[1]).min(leave);
+            // The ray's lowest point inside this cell.
+            let low = from[2] + toward[2] * if toward[2] >= 0.0 { t } else { exit };
+            if toward[2] >= 0.0 && low > self.highest {
+                return false;
+            }
+            let index = cell[1] * self.cols + cell[0];
+            if low <= self.top[index] && self.hits_in(index, from, toward, max) {
+                return true;
+            }
+            if exit >= leave {
+                return false;
+            }
+            let axis = if next[0] < next[1] { 0 } else { 1 };
+            let moved = cell[axis] as isize + step[axis];
+            if moved < 0 || moved as usize >= n[axis] {
+                return false;
+            }
+            cell[axis] = moved as usize;
+            t = next[axis];
+            next[axis] += delta[axis];
+        }
+    }
+}
+
+/// The distance along a ray to a triangle, if it meets it in front of its
+/// start, and the barycentric weights of the second and third corners at the
+/// hit (Möller–Trumbore).
+fn ray_meets(origin: [f32; 3], dir: [f32; 3], t: &[[f32; 3]; 3]) -> Option<(f32, f32, f32)> {
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    };
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let e1 = sub(t[1], t[0]);
+    let e2 = sub(t[2], t[0]);
+    let h = cross(dir, e2);
+    let a = dot(e1, h);
+    if a.abs() < 1.0e-12 {
+        return None;
+    }
+    let f = 1.0 / a;
+    let s = sub(origin, t[0]);
+    let u = f * dot(s, h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = cross(s, e1);
+    let v = f * dot(dir, q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let d = f * dot(e2, q);
+    (d > 1.0e-4).then_some((d, u, v))
+}
+
+/// Two occluders as one: a ray is blocked when either blocks it.
+pub struct Either<'a>(pub &'a (dyn Occluder + Sync), pub &'a (dyn Occluder + Sync));
 
 impl Occluder for Either<'_> {
     fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
@@ -286,24 +519,23 @@ impl Occluder for Either<'_> {
 pub struct Baked {
     /// Chunks whose bits are not what they were.
     pub changed: usize,
-    /// …and how many of the 256 came out with any shadow on them at all.
+    /// Chunks of the 256 with any texel in shadow.
     pub shadowed: usize,
 }
 
-/// **Recompute one chunk's `MCSH`.** Returns the 512 packed bits.
+/// Recompute one chunk's `MCSH`. Returns the 512 packed bytes.
 ///
-/// The texel grid is the alpha map's: row `ty` runs along decreasing world x and
-/// column `tx` along decreasing world y, from the chunk's origin, which is its
-/// maximum corner in both. That is the layout `Adt::alpha_atlas` assumes, the
-/// one `vale textures`' seam check pins, and the one `vale sun` reads
-/// shadows back through — a bake written under any other convention measures
-/// correct and lands rotated.
+/// The texel grid is the alpha map's: row `ty` runs along decreasing world x
+/// and column `tx` along decreasing world y, from the chunk's origin, which is
+/// its maximum corner in both. This is the layout `Adt::alpha_atlas` assumes,
+/// the one `vale textures`' seam check pins, and the one `vale sun` reads
+/// shadows through. A bake under any other layout would land rotated or
+/// mirrored.
 ///
-/// **Texel 63 of each axis is computed and never read.** The pre-Cataclysm
-/// client stretches a 64x64 map so texels 0 and 62 sit on the chunk's edges, so
-/// `decode_shadow_map` copies 62 into 63 on the way in. Writing an honest value
-/// there costs nothing and means the file says what the geometry says rather
-/// than what one reader happens to do with it.
+/// Texel 63 of each axis is computed but not read. The 1.12.1 client stretches
+/// a 64x64 map so texels 0 and 62 sit on the chunk's edges, and
+/// `decode_shadow_map` copies 62 into 63 when reading. The bake writes the
+/// value the geometry gives for 63 anyway.
 pub(crate) fn bake_chunk(
     tile: &AdtFile,
     chunk_index: usize,
@@ -337,49 +569,79 @@ pub(crate) fn bake_chunk(
     encode_shadow_map(&texels)
 }
 
-/// **Recompute every chunk's `MCSH`, and put the header in step with it.**
+/// Recompute every chunk's `MCSH` and set each chunk's `HAS_MCSH` flag to
+/// match.
 ///
-/// A chunk that comes out with no shadow at all **loses the region and the
-/// flag**, rather than carrying 64 bytes of zeroes. That is the same rule
-/// [`crate::adt::colours`] follows for `MCCV` and it is the same argument: an
-/// all-zero `MCSH` and no `MCSH` draw identically, and of the two only the
-/// second is what the shipped files do for an unshadowed chunk. Without it a
-/// tile bakes once and is permanently larger.
+/// A chunk with no texel in shadow loses its `MCSH` region and the flag,
+/// rather than keeping 64 bytes of zeroes. The two draw the same, the shipped
+/// files leave unshadowed chunks without the region, and keeping zeroes would
+/// make a tile larger after every bake. [`crate::adt::colours`] does the same
+/// for `MCCV`.
 ///
-/// Both directions matter. The region is *added* to a chunk that had none the
-/// moment something is placed to cast on it, and the flag with it — and the flag
-/// is what the reader keys off, so writing the region without it is a bake
-/// nothing draws.
+/// A chunk that gains shadow gains the region and the flag. The reader keys
+/// off the flag, so a region without it is not drawn.
 pub fn bake(
     tile: &mut AdtFile,
     sun: [f32; 3],
-    occluder: &dyn Occluder,
+    occluder: &(dyn Occluder + Sync),
     reach: f32,
 ) -> Baked {
     bake_watching(tile, sun, occluder, reach, &|_| {})
 }
 
-/// …and the same, saying how far it has got.
+/// [`bake`], reporting progress.
 ///
-/// `watch` is called with the number of chunks finished, after each one. A bake
-/// is about a minute and there are 256 of them, so this is the difference
-/// between a window that has stopped answering and one that is visibly working
-/// — see `vale_ide::map::tiles`, which runs it on a task pool and draws
-/// the count on the status line.
-///
-/// It is a separate entry point rather than an `Option` on [`bake`] because
-/// every existing caller wants neither, and because the closure has to be
-/// `Send` for the pool while [`bake`]'s callers are on the main thread.
+/// The chunks are baked on one thread per core and written back in order
+/// afterwards. `watch` is called once per finished chunk with the number
+/// finished so far, 1 up to the chunk count, one call at a time.
+/// `vale_ide::map::tiles` runs a bake on a task pool and shows the count on
+/// the status line.
 pub fn bake_watching(
     tile: &mut AdtFile,
     sun: [f32; 3],
-    occluder: &dyn Occluder,
+    occluder: &(dyn Occluder + Sync),
     reach: f32,
     watch: &(dyn Fn(usize) + Sync),
 ) -> Baked {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let count = tile.chunks.len().min(CHUNKS_PER_SIDE * CHUNKS_PER_SIDE);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(count.max(1));
+    let next = AtomicUsize::new(0);
+    let done = Mutex::new(0usize);
+    let mut results: Vec<Option<Vec<u8>>> = vec![None; count];
+    {
+        let shared: &AdtFile = tile;
+        let finished: Vec<Vec<(usize, Vec<u8>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            if index >= count {
+                                break;
+                            }
+                            mine.push((index, bake_chunk(shared, index, sun, occluder, reach)));
+                            let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+                            *done += 1;
+                            watch(*done);
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+        });
+        for (index, bits) in finished.into_iter().flatten() {
+            results[index] = Some(bits);
+        }
+    }
+
     let mut baked = Baked::default();
-    for index in 0..tile.chunks.len().min(CHUNKS_PER_SIDE * CHUNKS_PER_SIDE) {
-        let bits = bake_chunk(tile, index, sun, occluder, reach);
+    for (index, bits) in results.into_iter().enumerate() {
+        let bits = bits.unwrap_or_else(|| encode_shadow_map(&[0u8; ALPHA_LEN]));
         let any = bits.iter().any(|&b| b != 0);
         if any {
             baked.shadowed += 1;
@@ -387,7 +649,6 @@ pub fn bake_watching(
         if set_shadow(tile, index, any.then_some(bits.as_slice())) {
             baked.changed += 1;
         }
-        watch(index + 1);
     }
     baked
 }
@@ -422,11 +683,10 @@ pub(crate) fn set_shadow(tile: &mut AdtFile, chunk_index: usize, bits: Option<&[
 }
 
 /// A chunk's `MCSH` as one byte per texel, `255` in shadow, decoded by
-/// `vale_assets`' reader, for a caller comparing the two.
+/// `vale_assets`' reader.
 ///
-/// `None` when the chunk declares no shadow, which is the honest answer and not
-/// an empty grid: *no shadow declared* and *a shadow that happens to be empty*
-/// are the same picture and different files.
+/// `None` when the chunk declares no shadow. That draws the same as an
+/// all-zero map but is a different file.
 pub fn shadow_texels(tile: &AdtFile, chunk_index: usize) -> Option<Vec<u8>> {
     let chunk = tile.chunks.get(chunk_index)?;
     if u32_at(&chunk.header, at::FLAGS) & mcnk_flags::HAS_MCSH == 0 {
@@ -457,7 +717,7 @@ fn put_u32(buf: &mut [u8], at: usize, value: u32) {
 mod tests {
     use super::*;
     use crate::adt::blank::{blank_tile, chunk_origin};
-    use vale_assets::tables::light::SUN_TOWARD;
+    use vale_assets::tables::light::SHADOW_SUN as SUN_TOWARD;
 
     const GRASS: &str = r"Tileset\Elwynn\ElwynnGrassBase.blp";
 
@@ -473,9 +733,9 @@ mod tests {
         }
     }
 
-    /// **Nothing casting means no region and no flag**, rather than a region of
-    /// zeroes. A blank tile has neither to begin with, so this is also the check
-    /// that a bake over empty ground leaves the file alone.
+    /// With nothing casting, no chunk has an `MCSH` region or flag. A blank
+    /// tile has neither to begin with, so this also checks that a bake over
+    /// empty ground leaves the file unchanged.
     #[test]
     fn an_unoccluded_tile_carries_no_shadow_at_all() {
         let mut tile = tile();
@@ -488,7 +748,8 @@ mod tests {
         }
     }
 
-    /// …and everything casting sets the region, the flag and every bit.
+    /// With everything casting, every chunk has the region, the flag and every
+    /// bit set.
     #[test]
     fn a_fully_occluded_tile_is_all_shadow() {
         let mut tile = tile();
@@ -503,9 +764,9 @@ mod tests {
         }
     }
 
-    /// **And baking it back to nothing takes the region away again**, so a tile
-    /// whose buildings were deleted writes back as a tile with no shadow rather
-    /// than 16 KB of zeroes.
+    /// Baking with nothing after baking with everything removes the regions
+    /// and flags again, so a tile whose casters were deleted is written without
+    /// shadow rather than with 16 KB of zeroes.
     #[test]
     fn clearing_a_bake_removes_the_region_and_the_flag() {
         let mut tile = tile();
@@ -518,12 +779,12 @@ mod tests {
             .chunks
             .iter()
             .all(|c| c.head().flags() & mcnk_flags::HAS_MCSH == 0));
-        // …and the file is the one it started as.
+        // The file is the one the tile started as.
         assert_eq!(tile.write(), self::tests::tile().write());
     }
 
-    /// A second bake with the same occluder changes nothing, which is what lets
-    /// a caller bake on every edit without rewriting the file every time.
+    /// A second bake with the same occluder changes nothing, so a caller can
+    /// rebake without rewriting an unchanged file.
     #[test]
     fn baking_twice_is_idempotent() {
         let mut tile = tile();
@@ -532,11 +793,10 @@ mod tests {
         assert_eq!(again.changed, 0);
     }
 
-    /// **The bits land on the texels the geometry is over.** An occluder that
-    /// blocks only rays starting past a world x cuts the tile in half, and the
-    /// half it cuts has to be the half the texel mapping says — which is the one
-    /// thing here that a correct-looking result can get wrong, because a
-    /// transposed or mirrored map is still a plausible shadow.
+    /// The bits land on the texels the occluder covers. An occluder that blocks
+    /// only rays starting below a world x shadows the rows the texel mapping
+    /// puts there. A transposed or mirrored map would still look like a
+    /// plausible shadow, so this is checked directly.
     #[test]
     fn a_half_blocked_chunk_shadows_the_right_half() {
         let mut tile = tile();
@@ -557,8 +817,7 @@ mod tests {
         }
     }
 
-    /// …and the same in the other axis, since one test can only pin one of the
-    /// two ways a grid transposes.
+    /// The same check along world y and the texel columns.
     #[test]
     fn a_half_blocked_chunk_shadows_the_right_columns() {
         let mut tile = tile();
@@ -576,14 +835,13 @@ mod tests {
         }
     }
 
-    /// **The bit order is the reader's.** A bake packed MSB-first decodes as a
-    /// comb at a period of eight texels along one axis, which looks like lace
-    /// rather than like an error — so this compares against the reader's own
-    /// decode rather than against an expectation written here.
+    /// The bake packs bits in the order the reader unpacks them. A bake packed
+    /// most significant bit first would decode as stripes with a period of
+    /// eight texels, so this compares against the reader's own decode.
     #[test]
     fn the_packed_bits_are_the_order_the_reader_unpacks() {
         let mut tile = tile();
-        // One texel in eight, so a mirrored byte is unmistakable.
+        // One column in eight, so a mirrored byte shows.
         let every_eighth = |from: [f32; 3], _: [f32; 3], _: f32| {
             let origin = chunk_origin(32, 48, 0);
             let texel = CHUNK_SIZE / ALPHA_SIDE as f32;
@@ -606,8 +864,7 @@ mod tests {
         }
     }
 
-    /// A tile that has been baked is still a tile the reader reads, which is
-    /// the end-to-end the other tests approach one field at a time.
+    /// A baked tile parses with `vale_assets`' reader and with this crate's.
     #[test]
     fn a_baked_tile_still_parses() {
         let mut tile = tile();
@@ -619,13 +876,12 @@ mod tests {
             assert_eq!(chunk.shadow.len(), ALPHA_SIDE * ALPHA_SIDE);
             assert!(chunk.shadow.iter().all(|&t| t == 255));
         }
-        // …and this crate can read it back too.
+        // This crate reads it back byte for byte.
         assert_eq!(AdtFile::parse(&raw).unwrap().write(), raw);
     }
 
-    /// **Flat ground shadows nothing**, which is the identity the marcher has to
-    /// have: every sample is at the same height as the ray's start and the ray
-    /// climbs away from it.
+    /// Flat ground casts no shadow on itself: every sample is at the height of
+    /// the ray's start and the ray climbs away from it.
     #[test]
     fn flat_ground_casts_no_shadow_on_itself() {
         let mut tile = tile();
@@ -634,14 +890,15 @@ mod tests {
         assert_eq!(baked.shadowed, 0, "flat ground shadowed itself");
     }
 
-    /// …and a wall of ground does. Raise one half of the tile far above the
-    /// other and the low half has to come out shadowed on the side the sun is
-    /// on — which is the check that the marcher walks the right way.
+    /// A step in the ground shadows the low side next to it. One half of the
+    /// tile is raised 300 yards; the chunk at the foot of the step, on the side
+    /// away from the sun, must be shadowed. This checks that the march walks
+    /// toward the sun.
     #[test]
     fn a_step_in_the_ground_shadows_what_is_behind_it() {
         let mut tile = tile();
-        // The sun is at azimuth 40 from +x toward +y, so it is in the +x/+y
-        // direction: ground at *higher* x shadows ground at lower x.
+        // The sun is at azimuth 45 from +x toward +y, so ground at higher x
+        // shadows ground at lower x.
         for index in 0..tile.chunks.len() {
             let origin = chunk_origin(32, 48, index);
             // Chunks in the half nearer the tile's maximum x get raised.
@@ -658,11 +915,8 @@ mod tests {
             baked.shadowed > 0,
             "a 300-yard step cast nothing at all"
         );
-        // **The chunk immediately below the step**, which is row 8 — the first
-        // unraised row, with a 300-yard wall along its high-x edge. Further
-        // down the tile the wall is past `REACH` and the ground is legitimately
-        // lit, which is what the first draft of this test asserted on and why it
-        // failed: a shadow is only as long as the reach allows.
+        // Chunk 128 is the first chunk of row 8, the first unraised row, with
+        // the 300-yard wall along its high-x edge.
         let low = shadow_texels(&tile, 128).expect("the chunk under the step has a shadow");
         let shadowed = low.iter().filter(|&&t| t != 0).count();
         assert!(
@@ -670,16 +924,15 @@ mod tests {
             "only {shadowed} of {} texels under a 300-yard wall are shadowed",
             low.len()
         );
-        // …and the raised half, which nothing stands over, is not.
+        // The raised half, which nothing stands over, is lit.
         assert!(
             shadow_texels(&tile, 0).is_none(),
             "the top of the step shadowed itself"
         );
     }
 
-    /// A ray that leaves the tile stops rather than marching against the edge
-    /// for ever — which without the `None` arm is an infinite band of shadow
-    /// along two edges.
+    /// A ray off the tile is not blocked by the ground occluder, which knows
+    /// no ground there.
     #[test]
     fn a_ray_off_the_tile_is_not_blocked() {
         let tile = tile();
@@ -689,8 +942,7 @@ mod tests {
         assert!(!ground.blocked(outside, normalise(SUN_TOWARD), REACH));
     }
 
-    /// **Two occluders compose**, which is how a caller puts the ground and the
-    /// buildings in one bake.
+    /// `Either` blocks a ray when either occluder does.
     #[test]
     fn either_is_blocked_when_either_is() {
         let yes = Everything;
@@ -702,8 +954,8 @@ mod tests {
         assert!(!Either(&no, &no).blocked(from, up, 10.0));
     }
 
-    /// **The watcher is told about every chunk, once, in order.** A progress
-    /// bar that skipped or repeated would read as a bake that had stalled.
+    /// The watcher is called once per chunk with 1, 2, … up to the chunk
+    /// count, in order, although the chunks are baked on several threads.
     #[test]
     fn a_bake_reports_every_chunk_once() {
         let mut tile = tile();
@@ -718,9 +970,8 @@ mod tests {
         assert!(seen.windows(2).all(|w| w[1] == w[0] + 1), "out of order");
     }
 
-    /// The ray leaves from above the ground rather than on it. Without the lift
-    /// a bake whose occluder includes the terrain has every ray hit the triangle
-    /// it started on and the whole world comes out black.
+    /// Rays start `LIFT` above the ground. Starting on it, a bake that includes
+    /// the terrain would have every ray hit the triangle it starts on.
     #[test]
     fn rays_start_above_the_ground() {
         let tile = tile();
@@ -733,5 +984,106 @@ mod tests {
         let seen = seen.into_inner();
         assert_eq!(seen.len(), ALPHA_SIDE * ALPHA_SIDE);
         assert!(seen.iter().all(|&z| (z - (100.0 + LIFT)).abs() < 0.001));
+    }
+
+    /// A horizontal square of two triangles, centred on `(x, y)` at height
+    /// `z`, `half` yards from centre to edge.
+    fn square(x: f32, y: f32, z: f32, half: f32) -> Vec<[[f32; 3]; 3]> {
+        let (a, b, c, d) = (
+            [x - half, y - half, z],
+            [x + half, y - half, z],
+            [x + half, y + half, z],
+            [x - half, y + half, z],
+        );
+        vec![[a, b, c], [a, c, d]]
+    }
+
+    fn casters(triangles: Vec<[[f32; 3]; 3]>) -> Casters {
+        Casters::new(
+            ShadowCasters {
+                triangles,
+                ..Default::default()
+            },
+            128,
+        )
+    }
+
+    /// A ray straight up is blocked by a square above it and not by one beside
+    /// it.
+    #[test]
+    fn casters_block_what_is_overhead() {
+        let up = [0.0, 0.0, 1.0];
+        let over = casters(square(10.0, 10.0, 20.0, 1.0));
+        assert!(over.blocked([10.0, 10.0, 0.0], up, REACH));
+        assert!(!over.blocked([20.0, 10.0, 0.0], up, REACH));
+        // Above the square, the ray meets nothing.
+        assert!(!over.blocked([10.0, 10.0, 30.0], up, REACH));
+        // Shorter than the distance to the square, the ray meets nothing.
+        assert!(!over.blocked([10.0, 10.0, 0.0], up, 10.0));
+    }
+
+    /// The grid walk gives the same answer as testing every triangle, over a
+    /// scattered set and slanted rays that cross many cells.
+    #[test]
+    fn casters_agree_with_testing_every_triangle() {
+        let mut seed = 12345u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut triangles = Vec::new();
+        for _ in 0..300 {
+            let (x, y, z) = (next() * 200.0 - 100.0, next() * 200.0 - 100.0, next() * 40.0);
+            let half = 0.5 + next() * 3.0;
+            triangles.extend(square(x, y, z, half));
+        }
+        let grid = casters(triangles.clone());
+        let sun = normalise(SUN_TOWARD);
+        let (mut hits, mut tested) = (0, 0);
+        for _ in 0..4000 {
+            let from = [next() * 240.0 - 120.0, next() * 240.0 - 120.0, next() * 10.0 - 5.0];
+            let every = triangles
+                .iter()
+                .any(|t| ray_meets(from, sun, t).is_some_and(|(d, _, _)| d <= REACH));
+            assert_eq!(grid.blocked(from, sun, REACH), every, "from {from:?}");
+            hits += usize::from(every);
+            tested += 1;
+        }
+        assert!(hits > tested / 20, "only {hits} of {tested} rays hit anything");
+    }
+
+    /// A cut-out triangle casts where its texture is opaque and not where it
+    /// is transparent.
+    #[test]
+    fn a_cut_out_casts_only_where_its_texture_is_opaque() {
+        let triangles = square(0.0, 0.0, 10.0, 1.0);
+        // Two texels across: the left column transparent, the right opaque.
+        let mask = AlphaMask {
+            width: 2,
+            height: 1,
+            alpha: vec![0, 255],
+        };
+        // u runs with world x across the square.
+        let uv = |p: [f32; 3]| [(p[0] + 1.0) / 2.0, 0.5];
+        let cutouts = triangles
+            .iter()
+            .map(|t| {
+                Some(Cutout {
+                    mask: 0,
+                    uvs: [uv(t[0]), uv(t[1]), uv(t[2])],
+                })
+            })
+            .collect();
+        let grid = Casters::new(
+            ShadowCasters {
+                triangles,
+                cutouts,
+                masks: vec![mask],
+            },
+            128,
+        );
+        let up = [0.0, 0.0, 1.0];
+        assert!(!grid.blocked([-0.5, 0.0, 0.0], up, REACH), "the transparent half cast");
+        assert!(grid.blocked([0.5, 0.0, 0.0], up, REACH), "the opaque half did not cast");
     }
 }

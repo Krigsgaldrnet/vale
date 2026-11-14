@@ -23,9 +23,9 @@
 //! mean of 7/7/7; `ocean_h` peaks at 82 and has the same shape. They are
 //! luminance masks for foam and glints. A surface drawn as `texel.rgb` blended
 //! over the canal bed is a black sheet at a third opacity, which looks the same
-//! as a dark shadow; Stormwind's canals were drawn this way after the depth
-//! fix. Lava and slime use the same code path and decode to 175/22/0 and
-//! 68/132/18, which is why they were visible all along.
+//! as a dark shadow; Stormwind's canals were drawn this way before the colour
+//! was read from this chain. Lava and slime use the same code path and decode
+//! to 175/22/0 and 68/132/18, so their texture alone gives a visible colour.
 //!
 //! The colour comes from the client's light chain, per zone and per time of
 //! day, and 1.12 ships it in these tables:
@@ -49,8 +49,8 @@
 //!
 //! Bands 13..16 are the water colours, and they are `close`/`far`, not
 //! `shallow`/`deep`. A shallow/deep pair would darken from the first colour to
-//! the second, and an earlier check assumed so. Across every default light the
-//! game ships, the second of each pair is brighter in 15 of 19: the mean of
+//! the second. Across every default light the game ships, the second of each
+//! pair is brighter in 15 of 19: the mean of
 //! band 15 is `79/85/91` and of band 16 `83/79/66`. They are the near and the
 //! far colour of the surface, and the far one tends toward the fog colour.
 //! Depth does not affect the colour:
@@ -190,15 +190,14 @@ mod band {
     /// as the sun goes down: half the fill's total at noon and nine tenths of
     /// it at midnight.
     ///
-    /// These measurements were once read as the colour of ground in a baked
-    /// `MCSH` shadow, used in place of the sun. That reading is wrong.
+    /// These measurements fit the colour of ground in a baked `MCSH` shadow,
+    /// used in place of the sun, but band 17 is not that colour.
     /// `Shaders\Pixel\terrain1.bls`, the client's terrain fragment program,
     /// quoted in full in the renderer's `atmosphere.wgsl`, applies `MCSH` as a
     /// flat `shadow * 0.3 + 0.7` scalar over the whole modulated result. The
-    /// client's terrain path has no shadow colour, so a band with the right
-    /// shape for one is still not one.
+    /// client's terrain shading has no shadow colour for any band to supply.
     ///
-    /// Open question: what row 17 is. One candidate is river-far. The
+    /// What row 17 holds is not established. One candidate is river-far. The
     /// canonical `LightIntBand` layout puts ocean at 14/15 and river at 16/17,
     /// one row above the four water constants above. Either those four are one
     /// row too low and every water colour this client draws is off by a band,
@@ -300,9 +299,9 @@ pub const FLOAT_BAND_NAMES: [&str; FLOAT_BANDS_PER_PARAMS as usize] = [
 /// Empty where the name says everything.
 ///
 /// The names and notes are kept here rather than in the caller so that there
-/// is one copy. `vale light` once kept a second copy of this list, and it went
-/// stale: its note on band 17 still stated the shadow-colour reading that
-/// [`band::SHADOW`] records as disproved by `terrain1.bls`.
+/// is one copy. A second copy in `vale light` went out of date: its note on
+/// band 17 kept the shadow-colour reading that [`band::SHADOW`] records as
+/// disproved by `terrain1.bls`.
 pub const INT_BAND_NOTES: [&str; BANDS_PER_PARAMS as usize] = [
     "The single directional light the world is lit by.",
     "The ambient fill. Darker than the sun in all 19 default lights.",
@@ -553,17 +552,17 @@ impl Weather {
 /// of 355 rows have a named tele point inside their own falloff sphere,
 /// against 66, 73 and 76 for the three alternatives.
 ///
-/// The names are stronger evidence than the count. Under this reading light 3
-/// lands 20 yards from `SwampOfSorrows`, light 5 42 from `DeadwindPass`, light
+/// The named matches are stronger evidence than the count. Under this reading
+/// light 3 lands 20 yards from `SwampOfSorrows`, light 5 42 from `DeadwindPass`, light
 /// 39 (a 152..229 yard sphere) 71 from `BootyBay`, lights 51 and 52 (63..90
 /// yards each) 52 and 54 from `DwarvenDistrict`, light 62 19 from
 /// `PlaguewoodTower` and light 61 7 from `RavenholdtManor`. A wrong corner or
-/// a transposed pair would not put forty small spheres on forty named
-/// landmarks.
+/// a transposed pair of columns would not place forty small spheres on forty
+/// named landmarks.
 ///
-/// The resulting reading is exactly the existing `placement_to_world`, which
-/// vmangos' `convertPositionToInternalRep` confirms. That is a second,
-/// independent source, and a source file rather than a fit.
+/// The resulting reading is exactly the existing `placement_to_world`.
+/// vmangos' `convertPositionToInternalRep` states the same conversion in
+/// source code, independently of the fit.
 pub use crate::world::adt::MAP_ORIGIN as WORLD_CORNER;
 
 /// A day is 2,880 half-minutes, which is the unit `LightIntBand`'s times are in.
@@ -608,10 +607,29 @@ pub const NOON: u32 = DAY / 2;
 /// client's light at 17:50 travels along `(-0.6625, -0.6625, -0.3497)`,
 /// azimuth 225° and 20.5° up, which matches the track to half a degree, so the
 /// renderer aims its light by [`celestial::light_toward`] and follows the
-/// hour. This constant is used for everything that has to agree with the
-/// shipped `MCSH` and the shipped minimaps: `vale sun`, the shadow bake and
-/// the minimap bake.
+/// hour. This constant is used by `vale sun` and by the minimap bake, whose
+/// lighting terms were fitted to the shipped minimaps under it.
+///
+/// The shadow bake does not use it. `vale sun` measured these angles from the
+/// shadows of collision hulls, which are mostly trunks; the shadow bake uses
+/// [`SHADOW_SUN`], measured from the full drawn models.
 pub const SUN_TOWARD: [f32; 3] = [0.587, 0.492, 0.643];
+
+/// The direction the shipped `MCSH` shadow maps were cast toward: a unit
+/// vector from the world toward the sun, in the world's axes, equal to
+/// `(1, 1, 1.5)` normalised. Azimuth 45°, elevation 46.69°.
+///
+/// Measured by `vale bake <Map> <x> <y> sun`, which rebakes a sample of a
+/// tile's texels from the drawn, alpha-tested doodads under each direction of
+/// a grid and scores the result against the shipped map. The score peaks at
+/// azimuth 45.0° and elevation 46.5°..46.75° on `Azeroth_32_49`,
+/// `Azeroth_34_51` and `Kalimdor_32_26`, with 96.1–98.9% of texels agreeing
+/// at this direction. Azimuth 45° is also the bearing of the client's sun track
+/// ([`celestial::SUN`]).
+///
+/// Under [`SUN_TOWARD`] (azimuth 40°, elevation 40°) the same casting scores
+/// 90.0%, 90.4% and 97.6% on those three tiles.
+pub const SHADOW_SUN: [f32; 3] = [0.485_071_25, 0.485_071_25, 0.727_606_9];
 
 /// What the game draws in the sky, and when: the stars, the sun's disc and the
 /// moon's, on day-fraction curves.
@@ -619,8 +637,8 @@ pub const SUN_TOWARD: [f32; 3] = [0.587, 0.492, 0.643];
 /// `Light.dbc` states none of this: the table gives colours at an hour and
 /// nothing about whether the star dome is visible. These are the 1.12.1
 /// client's fixed values, which no data file states. They are reproduced
-/// exactly because a star field faded on a plausible curve looks the same as
-/// one faded on the right curve except at the hours where the two differ.
+/// exactly: a star field faded on an approximate curve differs from the
+/// client's only at some hours, so the error is easy to miss.
 ///
 /// ## Day curves
 ///
@@ -847,8 +865,7 @@ pub mod celestial {
     /// Its azimuth is constant: it rises and sets on one bearing, 45°,
     /// north-west in the world's axes. This is the bearing [`LIGHT_AZIMUTH`]
     /// puts the lighting sun at, and within five degrees of the 40° that
-    /// [`super::SUN_TOWARD`] was measured at from the `MCSH` bakes. Three
-    /// independent sources agree.
+    /// [`super::SUN_TOWARD`] was measured at from the `MCSH` bakes.
     pub const SUN: Body = Body {
         polar: DayTrack {
             keys: &[
@@ -975,13 +992,12 @@ pub mod celestial {
     /// is a sun 20° to 37° above the horizon that never sets; night is shown
     /// entirely through colour.
     ///
-    /// Used through [`light_toward`]. It was once left unused, on the argument
-    /// that a light moving 17° over a day against shadows baked for one angle
-    /// would look worse than a fixed light that agrees with them. The 1.12.1
-    /// client's light at 17:50 travels along `(-0.6625, -0.6625, -0.3497)`,
-    /// which is this track to half a degree over the same baked shadows, so
-    /// the client does not use a fixed light. [`super::SUN_TOWARD`] is used
-    /// only for checking against the bakes.
+    /// Used through [`light_toward`]. The light moves 17° over a day while
+    /// the baked shadows stay at one angle. The 1.12.1 client's light at
+    /// 17:50 travels along `(-0.6625, -0.6625, -0.3497)`, which is this track
+    /// to half a degree over the same baked shadows, so the client does not
+    /// use a fixed light either. [`super::SUN_TOWARD`] is used only for
+    /// checking against the bakes.
     pub const LIGHT_POLAR: DayTrack = DayTrack {
         keys: &[
             (0.0, PI * 0.7055556),  // 00:00, 127°
@@ -1279,10 +1295,9 @@ pub struct LiquidLight {
 impl LiquidLight {
     /// What a liquid is drawn as when there is no light table.
     ///
-    /// Opaque white, which is wrong and conspicuous on purpose. The
-    /// alternative, the texture's own near-black colour, is the fault this
-    /// module fixes, and a missing table must not reproduce a fault that cannot
-    /// be seen. See [`LightTables`]' note on degradation.
+    /// Opaque white, chosen to be visibly wrong. The alternative, the
+    /// texture's own near-black colour, looks like a shadow, so a missing
+    /// table would go unnoticed. See [`LightTables`]' note on degradation.
     pub const UNLIT: LiquidLight = LiquidLight {
         close: [1.0, 1.0, 1.0],
         far: [1.0, 1.0, 1.0],
@@ -1339,7 +1354,7 @@ pub struct PositionalLight {
     pub at: [f32; 3],
     /// The same three floats as the file states them, kept so that
     /// `vale light` can score the other readings of them against the tiles
-    /// each map ships. A decode whose input is not kept cannot be checked.
+    /// each map ships; the decoded centre alone does not allow that.
     pub raw: [f32; 3],
     /// Inside this radius the row applies at full strength.
     pub falloff_start: f32,
@@ -1432,8 +1447,8 @@ pub fn skybox_models(bytes: &[u8]) -> std::collections::HashMap<u32, String> {
 ///
 /// Optional, and its absence is a documented degradation, as for every table
 /// except the three that resolve a model. Without it every liquid draws
-/// [`LiquidLight::UNLIT`], a flat white sheet. That is conspicuous on purpose,
-/// because the fault it replaces could not be seen.
+/// [`LiquidLight::UNLIT`], a flat white sheet. The white is chosen to be
+/// visible: the texture's own near-black colour looks like a shadow.
 pub struct LightTables {
     /// Per map: the ids of the `LightParams` rows the map's default light
     /// names.
@@ -1835,10 +1850,9 @@ impl LightTables {
     ///
     /// Without this each continent is lit one way; with it each zone has its
     /// own light. Map 0 ships one default light and eighty spheres over it.
-    /// Before the spheres were read, Stormwind, Duskwood, Westfall,
-    /// Stranglethorn and Ironforge were all drawn in Elwynn's daylight.
-    /// Goldshire is covered by no sphere, which is why it looked right in the
-    /// screenshots in this repo while the other zones did not.
+    /// Without the spheres, Stormwind, Duskwood, Westfall, Stranglethorn and
+    /// Ironforge are all drawn in Elwynn's daylight. Goldshire is covered by
+    /// no sphere, so it is drawn the same with or without them.
     ///
     /// See [`Self::lights_at`] for the blend and for which part of it is
     /// measured.
@@ -1885,15 +1899,16 @@ impl LightTables {
     /// the server sends. At 0 this returns exactly [`Self::atmosphere_in`]
     /// (tested), so a clear day neither pays for this nor is changed by it.
     ///
-    /// Data and interpretation: that `Light.dbc` carries a storm row per
+    /// What is data: that `Light.dbc` carries a storm row per
     /// light, that it is column 2 of the five, and what it contains (a darker
     /// sun, a colder fill, a dome with less blue, and fog pulled in to a
     /// fraction of the clear row's) is the table, printed by `vale weather`.
     /// That the two are mixed rather than switched, and that the mix is linear
-    /// in the grade, is this client's reading. It has not been confirmed
-    /// whether the 1.12.1 client blends on the grade or on the density, or
-    /// crossfades over a fixed time instead. The direction is not in doubt: a
-    /// client that ignores the column draws Elwynn's noon behind a downpour.
+    /// in the grade, is this client's interpretation. It has not been
+    /// confirmed whether the 1.12.1 client blends on the grade or on the
+    /// density, or crossfades over a fixed time instead. The storm row is read
+    /// either way: a client that ignores the column draws Elwynn's clear noon
+    /// sky behind a downpour.
     ///
     /// The grade is used rather than the density (`max(0, (g - 0.25) * 4/3)`)
     /// because the density is the particle count and is zero below a grade of
@@ -1988,8 +2003,9 @@ impl LightTables {
         self.lights_in(map, at, Weather::Clear)
     }
 
-    /// …and in a chosen weather — the same spheres in the same order, each
-    /// naming its own second row. See [`Self::atmosphere_in`].
+    /// [`Self::lights_at`] in a chosen weather: the same spheres in the same
+    /// order, each naming its row for that weather. See
+    /// [`Self::atmosphere_in`].
     ///
     /// The client lays the covering lights over the default in order of their
     /// centre's distance from `at`, farthest first, so the light whose centre
@@ -2104,11 +2120,11 @@ impl LightTables {
     /// Duskwood's light says nothing about river water, Ironforge's nothing
     /// about the ocean.
     ///
-    /// The distinction did not matter while the only caller was a map's
-    /// default, because a default states every band. Once a positional row was
-    /// read over a default, a band the row left empty showed as white water in
-    /// Duskwood: [`Self::band_colour`]'s conspicuous marker in place of a band
-    /// that the row left to its base.
+    /// A map's default states every band, so for a default the two cases do
+    /// not differ. For a positional row laid over a default they do: reading
+    /// an empty band through [`Self::band_colour`] draws its white marker,
+    /// which showed as white water in Duskwood, where the row leaves the band
+    /// to its base.
     pub fn band(&self, params_id: u32, band: u32, time: u32) -> Option<[f32; 3]> {
         let row = params_id.checked_sub(1)? * BANDS_PER_PARAMS + band + 1;
         let (times, colours) = self.bands.get(&row)?;

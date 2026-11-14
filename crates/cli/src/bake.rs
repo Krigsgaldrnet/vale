@@ -1,31 +1,42 @@
-//! `vale bake` — the three things an editor writes that nothing else does,
-//! measured against the files the game shipped.
+//! `vale bake`: the WDT, the minimap image and the `MCSH` shadow map that an
+//! editor writes, measured against the files the game shipped.
 //!
 //! ```text
-//! vale bake <Map>            what the map claims, and what is behind each claim
-//! vale bake <Map> <x> <y>    one tile: its minimap redrawn, its MCSH rebaked,
-//!                               each scored against the shipped one
+//! vale bake <Map>                          the tiles the WDT claims, and whether
+//!                                          each has an ADT behind it
+//! vale bake <Map> <x> <y>                  one tile: its minimap redrawn and its
+//!                                          MCSH rebaked, each scored against
+//!                                          the shipped one
+//! vale bake <Map> <x> <y> minimap [<dir>]  the minimap alone, drawn under a
+//!                                          sweep of looks
+//! vale bake <Map> <x> <y> shadow [<dir>]   the MCSH rebake alone, cast five
+//!                                          ways, each scored, with optional
+//!                                          comparison pictures
+//! vale bake <Map> <x> <y> sun              the default casting scored over a
+//!                                          sweep of sun directions
 //! ```
 //!
-//! ## Why these two need an instrument and the rest of the editor does not
+//! ## Why the minimap and the MCSH are scored against shipped tiles
 //!
-//! A terrain edit is checked by looking at it: the ground is where you put it
-//! or it is not. A **minimap** and an **`MCSH`** are different — both are
-//! derived pictures of a tile, both are produced by a rule nobody wrote down,
-//! and both look plausible when they are wrong. A minimap mirrored about either
-//! axis is a perfectly good picture of a place that is not there. A shadow map
-//! baked under the wrong sun is a perfectly good shadow falling the wrong way.
+//! A terrain edit can be checked by looking at it. A minimap and an `MCSH`
+//! cannot: both are images derived from a tile by an undocumented rule, and
+//! both look plausible when they are wrong. A minimap mirrored about either
+//! axis still looks like terrain, and a shadow map baked under the wrong sun
+//! still looks like shadow, falling the wrong way.
 //!
-//! But there are 1,500 shipped tiles that already carry the right answer. So
-//! this generates one and scores it against the other, which is the only check
-//! either of them can have.
+//! The 1,500 shipped tiles carry correct images. Each command here generates
+//! an image and scores it against the shipped one; no other check is
+//! available for either image.
 //!
-//! **A score is not a pass mark.** The generators here are not Blizzard's: the
-//! minimap draws swatch-per-layer where theirs rendered the real textures, and
-//! the shadow bake casts from this project's own collision hulls at a sun
-//! recovered by `vale sun`. What the numbers say is *this is a picture of the
-//! same place, the same way up* — which is the failure that matters and the one
-//! no amount of staring at a single file reveals.
+//! ## What a score means
+//!
+//! A score is not a pass mark. The generators here are not Blizzard's: the
+//! minimap draws one swatch per texture layer where the shipped images were
+//! rendered from the full textures, and the shadow bake casts from the drawn,
+//! alpha-tested doodad triangles and the building collision hulls at
+//! `vale_assets::tables::light::SHADOW_SUN`. A high score says the image shows
+//! the same place in the same orientation. That is the error that matters, and
+//! inspecting a single file does not reveal it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -39,7 +50,8 @@ use vale_config::Config;
 use vale_edit::adt::AdtFile;
 use vale_edit::{minimap, shadow};
 
-/// `vale bake <Map>` — what the map's WDT claims.
+/// `vale bake <Map>`: the tiles the map's WDT claims, and whether each has an
+/// ADT.
 pub fn cmd_bake_map(cfg: &Config, map: &str) -> Result<(), String> {
     let mut assets = crate::common::open_assets(cfg)?;
     let path = vale_edit::wdt::wdt_path(map);
@@ -56,9 +68,9 @@ pub fn cmd_bake_map(cfg: &Config, map: &str) -> Result<(), String> {
         );
     }
 
-    // **The round trip, on the real file.** The same check `AdtFile` has and for
-    // the same reason: a writer is worth exactly what its losslessness is worth,
-    // and a WDT is the one file where a dropped chunk costs a whole map.
+    // Check that the WDT writer reproduces the real file byte for byte, as
+    // `AdtFile`'s round trip does for ADTs. A writer that loses data cannot be
+    // used, and a chunk dropped from a WDT loses the whole map.
     match wdt.write() == raw {
         true => println!("  round trip: byte for byte"),
         false => println!("  ** round trip: the bytes changed"),
@@ -67,8 +79,8 @@ pub fn cmd_bake_map(cfg: &Config, map: &str) -> Result<(), String> {
     let tiles = wdt.tiles();
     println!("  {} of 4096 tiles claimed", tiles.len());
 
-    // …and what is actually behind each claim, which the WDT cannot say. A
-    // claimed tile with no ADT is a hole in the world that draws as nothing.
+    // Check that each claimed tile has an ADT, which the WDT does not record.
+    // A claimed tile with no ADT is a hole in the world that draws as nothing.
     let mut missing = Vec::new();
     for &(x, y) in &tiles {
         if assets.read(&vale_assets::adt_path(map, x, y)).is_err() {
@@ -87,27 +99,24 @@ pub fn cmd_bake_map(cfg: &Config, map: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `vale bake <Map> <x> <y>` — one tile, both pictures.
+/// `vale bake <Map> <x> <y>`: one tile's minimap and `MCSH`, each scored.
 pub fn cmd_bake_tile(cfg: &Config, map: &str, x: u32, y: u32) -> Result<(), String> {
     bake_tile(cfg, map, x, y, false, None)
 }
 
-/// `vale bake <Map> <x> <y> minimap` — the picture alone, over a sweep of
-/// looks.
+/// `vale bake <Map> <x> <y> minimap`: the minimap alone, drawn under a sweep
+/// of looks.
 ///
-/// **Because the minimap's settings are not derivable and the shadow bake is
-/// two minutes.** How dark a canopy reads, how wide a footprint is, how far the
-/// water grades: none of those is measurable from a file, all of them are
-/// measurable *against* the shipped picture, and iterating on them a minute at a
-/// time is how they end up guessed instead. This scores several in one archive
-/// load.
+/// The minimap's settings cannot be derived from a file: how dark a canopy
+/// reads, how wide a footprint is, how far the water grades. Each can only be
+/// measured against the shipped picture. This form scores several looks in
+/// one archive load and skips the shadow bake, which takes two minutes.
 ///
 /// `dump` is a directory: the drawn picture and the shipped one are written
-/// into it as `<Map>_<x>_<y>_drawn.png` and `_shipped.png`, because a
-/// correlation says which of two looks is *closer* and nothing about what is
-/// wrong with either. The picture beside the picture is what said the water
-/// was missing on `Azeroth_33_38` while `r` was reporting a small positive
-/// number.
+/// into it as `<Map>_<x>_<y>_drawn.png` and `_shipped.png`. A correlation says
+/// which of two looks is closer to the shipped picture and nothing about what
+/// is wrong with either. On `Azeroth_33_38`, `r` reported a small positive
+/// number while the two pictures side by side showed the water missing.
 pub fn cmd_bake_minimap(
     cfg: &Config,
     map: &str,
@@ -142,10 +151,10 @@ fn bake_tile(
     );
     let radii = radii_for(&mut assets, &adt);
     println!("    {} of the doodads it places could be sized", radii.len());
-    // **The neighbours, for their placements.** A building is recorded by the
-    // tile its origin stands on and drawn wherever it reaches, so the picture
-    // of this tile wants the eight files around it as well — see
-    // `vale_edit::minimap::render`.
+    // The eight neighbouring tiles, for their placements. A building is
+    // recorded in the tile its origin stands on and drawn wherever it reaches,
+    // so the picture of this tile needs the placements of the tiles around it.
+    // See `vale_edit::minimap::render`.
     let neighbours = neighbours_of(&mut assets, map, x, y);
     let everything: Vec<&Adt> = std::iter::once(&adt).chain(neighbours.iter()).collect();
     println!("    {} of the 8 neighbouring tiles exist", neighbours.len());
@@ -155,8 +164,8 @@ fn bake_tile(
         shapes.len(),
         shapes.values().map(|s| s.triangles.len()).sum::<usize>()
     );
-    // **The water's colour is the zone's**, from the same chain the world tints
-    // it by; see `minimap::Sources::water_of`, where the measurement is.
+    // The water takes the zone's colour, from the same chain the world tints
+    // water with. The measurement is recorded at `minimap::Sources::water_of`.
     let tables = crate::common::open_display_tables(&mut assets).ok();
     let map_id = crate::water::map_id_for(&mut assets, map);
     let centre = vale_assets::world::terrain::tile_centre(x, y);
@@ -192,14 +201,15 @@ fn bake_tile(
     }
     let shipped = shipped_minimap(&mut assets, map, x, y);
 
-    // **The sweep.** One line per setting, each scored against the shipped
-    // picture the same way, so the number that matters — which is *better* and
-    // not which is good — is read off one table.
+    // The sweep prints one line per setting, each scored against the shipped
+    // picture the same way, so the settings are compared in one table. The
+    // scores say which setting is better, not whether any setting is good.
     let base = minimap::Look::default();
     let mut looks: Vec<(String, minimap::Look, f32)> = vec![("default".into(), base, 1.0)];
     if minimap_only {
-        // **One at a time says which direction; a combination says whether they
-        // add.** Without this the sweep can only ever report the best single
+        // Varying one setting at a time shows which direction improves the
+        // score; varying several together shows whether the changes add.
+        // Without the combinations, the sweep can only report the best single
         // change from a default that may itself be wrong in two ways.
         for (ambient, diffuse) in [(0.3f32, 1.0f32), (0.46, 0.78), (0.6, 0.6), (1.0, 0.0)] {
             looks.push((
@@ -233,9 +243,9 @@ fn bake_tile(
 
     let mut best: Option<(String, Vec<u8>)> = None;
     let mut best_score = f32::MIN;
-    // **The default look's picture is the one reported on**, whatever the
-    // sweep prefers: it is the picture the editor writes, and the sweep's
-    // best is a number about a picture nobody sees.
+    // The reports below use the default look's picture, whichever look the
+    // sweep scores best, because the default look is the one the editor
+    // writes.
     let mut default_drawn: Option<Vec<u8>> = None;
     let swatch_of = |n: &str| swatches.get(&n.to_ascii_lowercase()).cloned();
     let shape_of = |n: &str| shapes.get(&n.to_ascii_lowercase()).cloned();
@@ -316,63 +326,8 @@ fn bake_tile(
         return Ok(());
     }
 
-    // ----------------------------------------------------------------- MCSH
     println!("\n  MCSH");
-    let mut tile = AdtFile::parse(&raw).map_err(|e| e.to_string())?;
-    let theirs: Vec<Option<Vec<u8>>> = (0..tile.chunks.len())
-        .map(|i| shadow::shadow_texels(&tile, i))
-        .collect();
-    let shipped_chunks = theirs.iter().filter(|t| t.is_some()).count();
-    let shipped_texels: usize = theirs
-        .iter()
-        .flatten()
-        .map(|t| t.iter().filter(|&&v| v != 0).count())
-        .sum();
-    println!("    shipped: {shipped_chunks} of 256 chunks carry one, {shipped_texels} texels in shadow");
-
-    let hulls = build_occluder(&mut assets, &everything, x, y);
-    // **Both ways round, because which of the two Blizzard's tools cast from is
-    // an open question and this is what would settle it.** The hulls alone are
-    // doodads and buildings; the ground alone is the terrain shadowing itself.
-    // If the shipped bakes carry terrain self-shadow, adding the ground should
-    // raise what is found without raising what is invented. If they do not, it
-    // will do the opposite — and the numbers say which.
-    let ground = shadow::Ground::of(&tile);
-    for (what, occluder) in [
-        ("hulls only", &hulls as &dyn shadow::Occluder),
-        ("hulls and ground", &shadow::Either(&ground, &hulls)),
-    ] {
-        let started = std::time::Instant::now();
-        let baked = shadow::bake(
-            &mut tile,
-            vale_assets::tables::light::SUN_TOWARD,
-            occluder,
-            shadow::REACH,
-        );
-        let took = started.elapsed();
-        let mine: Vec<Option<Vec<u8>>> = (0..tile.chunks.len())
-            .map(|i| shadow::shadow_texels(&tile, i))
-            .collect();
-        let mine_texels: usize = mine
-            .iter()
-            .flatten()
-            .map(|t| t.iter().filter(|&&v| v != 0).count())
-            .sum();
-        println!(
-            "    {what}: {} of 256 chunks, {mine_texels} texels, in {:.1}s",
-            baked.shadowed,
-            took.as_secs_f32()
-        );
-        score_shadow(&theirs, &mine);
-    }
-
-    // …and the file is still a file.
-    let out = tile.write();
-    match AdtFile::parse(&out).is_ok() && Adt::parse(&out).is_ok() {
-        true => println!("    the rebaked tile still parses, both ways"),
-        false => println!("    ** the rebaked tile does not parse"),
-    }
-    Ok(())
+    rebake_and_score(&mut assets, &everything, &raw, map, x, y, &[Casting::Default], None)
 }
 
 /// Every texture the tile names, reduced to a swatch.
@@ -388,8 +343,8 @@ fn swatches_for(
         let Ok(decoded) = blp::decode_mipped(&bytes) else {
             continue;
         };
-        // The smallest level that is still at least the swatch, which for a
-        // 256x256 tileset is one Blizzard already authored.
+        // Use the smallest mip level that is still at least `SWATCH` texels on
+        // a side. For a 256x256 tileset that level is stored in the file.
         let mut best = (0usize, decoded.level_size(0));
         for (i, _) in decoded.levels().enumerate() {
             let size = decoded.level_size(i);
@@ -412,8 +367,9 @@ fn swatches_for(
     out
 }
 
-/// **How wide each placed doodad is**, for the minimap's canopies: its drawn
-/// vertices — see `M2::footprint_radius`, which says why not its box.
+/// The footprint radius of each placed doodad, for the minimap's canopies,
+/// measured from its drawn vertices. `M2::footprint_radius` says why the
+/// bounding box is not used.
 fn radii_for(assets: &mut vale_assets::Assets, adt: &Adt) -> BTreeMap<String, f32> {
     let mut out = BTreeMap::new();
     for placed in adt.placed_doodads() {
@@ -433,8 +389,8 @@ fn radii_for(assets: &mut vale_assets::Assets, adt: &Adt) -> BTreeMap<String, f3
     out
 }
 
-/// **Every building the tiles place, as its drawn surface** — see
-/// `minimap::wmo_shape`. Each texture's mean colour is decoded once however
+/// Every building the tiles place, as its drawn surface (see
+/// `minimap::wmo_shape`). Each texture's mean colour is decoded once however
 /// many buildings share it.
 fn shapes_for(
     assets: &mut vale_assets::Assets,
@@ -484,7 +440,7 @@ fn mean_colour(assets: &mut vale_assets::Assets, path: &str) -> Option<[u8; 3]> 
     minimap::Swatch::from_rgba(level, w as usize, h as usize, 1).map(|s| s.rgb[0])
 }
 
-/// The eight tiles around one, parsed — those of them that exist.
+/// The tiles that exist among the eight around one, parsed.
 fn neighbours_of(assets: &mut vale_assets::Assets, map: &str, x: u32, y: u32) -> Vec<Adt> {
     let mut out = Vec::new();
     for dy in -1i64..=1 {
@@ -533,8 +489,8 @@ fn shipped_minimap(
         .then_some(blp.rgba)
 }
 
-/// Whether the best look still says north-west first, which the sweep must not
-/// quietly lose.
+/// Whether the best look still has north-west first. The sweep must not change
+/// the orientation without reporting it.
 fn report_orientation(
     _best: f32,
     _looks: &[(String, minimap::Look, f32)],
@@ -545,15 +501,15 @@ fn report_orientation(
 ) {
 }
 
-/// **What colour the two pictures are**, overall and by what is under each
+/// The mean colour of the two pictures, overall and by what is under each
 /// pixel.
 ///
-/// `r` is blind to this: Pearson's correlation is invariant to gain and offset,
-/// so a picture half as bright as the shipped one with every edge in the right
-/// place scores perfectly. The means are the number the correlation cannot see,
-/// and the per-depth water colours are what [`minimap::Look`]'s water is set
-/// from — the shipped picture, read back where the tile's own `MCLQ` says the
-/// water is.
+/// Pearson's correlation is invariant to gain and offset, so `r` does not
+/// measure colour: a picture half as bright as the shipped one, with every
+/// edge in the right place, scores 1. The means measure what the correlation
+/// does not. The per-depth water colours are what [`minimap::Look`]'s water is
+/// set from: the shipped picture, read where the tile's own `MCLQ` places
+/// water.
 fn report_colour(analysis: &minimap::Analysis, mine: &[u8], theirs: &[u8]) {
     let depths = &analysis.depth;
     let mean = |pixels: &[u8], keep: &dyn Fn(usize) -> bool| -> Option<[f32; 3]> {
@@ -591,8 +547,8 @@ fn report_colour(analysis: &minimap::Analysis, mine: &[u8], theirs: &[u8]) {
     show("water 6..12 yards", &|i| depths[i] > 6.0 && depths[i] <= 12.0);
     show("water 12..24 yards", &|i| depths[i] > 12.0 && depths[i] <= 24.0);
     show("water over 24 yards", &|i| depths[i] > 24.0);
-    // …and by the file's own depth byte, which is what the opacity is
-    // actually a function of.
+    // The same means by the file's depth byte, which is the value the water's
+    // opacity depends on.
     let bytes = &analysis.depth_byte;
     for (lo, hi) in [(1u8, 31u8), (32, 95), (96, 159), (160, 254), (255, 255)] {
         show(
@@ -602,15 +558,15 @@ fn report_colour(analysis: &minimap::Analysis, mine: &[u8], theirs: &[u8]) {
     }
 }
 
-/// **What the shipped picture multiplies the ground by**, read off it: by
-/// slope, by the baked shadow, by canopy cover and by texture.
+/// The gain the shipped picture applies to the ground, measured by slope, by
+/// the baked shadow, by canopy cover and by texture.
 ///
-/// Each line divides the shipped picture's mean by the *unlit* blend's mean
-/// over one class of pixel — so the number is the gain Blizzard's renderer
-/// applied there, and the drawn column beside it is the gain this one did.
-/// That is what [`minimap::Look`]'s three numbers are set from. The classes
-/// are kept apart: the slope table is over dry, unshadowed, uncovered,
-/// roofless pixels, so a hillside's gain is not a forest's darkness.
+/// Each line divides the shipped picture's mean by the unlit blend's mean over
+/// one class of pixel. The result is the gain Blizzard's renderer applied to
+/// that class; the drawn column beside it is the gain this renderer applied.
+/// [`minimap::Look`]'s three numbers are set from these gains. The classes are
+/// kept apart: the slope table is over dry, unshadowed, uncovered, roofless
+/// pixels, so canopy darkening does not enter a slope's gain.
 fn report_gains(adt: &Adt, analysis: &minimap::Analysis, mine: &[u8], theirs: &[u8]) {
     let n = minimap::SIDE * minimap::SIDE;
     let luma = |p: &[u8], i: usize| {
@@ -624,10 +580,10 @@ fn report_gains(adt: &Adt, analysis: &minimap::Analysis, mine: &[u8], theirs: &[
     // Dry, not under a roof, over a chunk: the pixels a gain can be read from.
     let dry = |i: usize| analysis.depth[i] <= 0.0 && !analysis.roof[i] && analysis.texture[i] != u32::MAX;
     let clean = |i: usize| dry(i) && !analysis.shadow[i] && analysis.canopy[i] < 0.05;
-    // The gain each picture applies over the unlit blend, and the **residual**
-    // — the shipped picture over the unlit blend *already lit by the default
-    // look's slope term* — so the shadow and canopy rows read a multiplier of
-    // their own rather than the slope of the ground they happen to stand on.
+    // The gain each picture applies over the unlit blend, and the residual:
+    // the shipped picture over the unlit blend already lit by the default
+    // look's slope term. The residual gives the shadow and canopy rows a
+    // multiplier of their own, without the slope of the ground under them.
     let look = minimap::Look::default();
     let gains = |keep: &dyn Fn(usize) -> bool| -> Option<(usize, f32, f32, f32)> {
         let (mut base, mut lit_base, mut shipped, mut drawn, mut count) =
@@ -700,7 +656,7 @@ fn report_gains(adt: &Adt, analysis: &minimap::Analysis, mine: &[u8], theirs: &[
         if count < 200 {
             continue;
         }
-        // …and the colour, since a gain can be a tint.
+        // The gain per colour channel as well, since a gain can be a tint.
         let (mut base, mut theirs_sum) = ([0f64; 3], [0f64; 3]);
         for i in 0..n {
             if !keep(i) {
@@ -790,7 +746,206 @@ fn correlation(pairs: &[(f32, f32)]) -> f32 {
     }
 }
 
-/// How much of the shipped shadow the rebake found, and how much it invented.
+// ---------------------------------------------------------------------------
+// MCSH
+// ---------------------------------------------------------------------------
+
+/// One way of casting a tile's shadow, for `vale bake ... shadow` to score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Casting {
+    /// What the editor bakes: drawn doodads, alpha-tested, and building hulls.
+    Default,
+    /// The same with every doodad triangle solid.
+    Solid,
+    /// The same with every drawn building triangle instead of the hulls.
+    DrawnBuildings,
+    /// The default and the terrain shadowing itself.
+    WithGround,
+    /// The collision hulls of doodads and buildings, which the editor cast
+    /// from before.
+    Hulls,
+}
+
+impl Casting {
+    const ALL: [Casting; 5] = [
+        Casting::Default,
+        Casting::Solid,
+        Casting::DrawnBuildings,
+        Casting::WithGround,
+        Casting::Hulls,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Casting::Default => "default",
+            Casting::Solid => "solid",
+            Casting::DrawnBuildings => "drawn-buildings",
+            Casting::WithGround => "ground",
+            Casting::Hulls => "hulls",
+        }
+    }
+}
+
+/// The settings of a shadow rebake that the instruments vary, read from the
+/// environment: `SUN=<azimuth>,<elevation>` in degrees, `REACH=<yards>` and
+/// `ALPHA=<0..255>`. Each defaults to what the editor uses.
+struct ShadowSettings {
+    sun: [f32; 3],
+    reach: f32,
+    alpha: u8,
+}
+
+impl ShadowSettings {
+    fn from_env() -> ShadowSettings {
+        let sun = std::env::var("SUN")
+            .ok()
+            .and_then(|s| {
+                let (a, e) = s.split_once(',')?;
+                Some(sun_direction(a.trim().parse().ok()?, e.trim().parse().ok()?))
+            })
+            .unwrap_or(vale_assets::tables::light::SHADOW_SUN);
+        let number = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<f32>().ok());
+        ShadowSettings {
+            sun,
+            reach: number("REACH").unwrap_or(shadow::REACH),
+            alpha: number("ALPHA").map_or(shadow::ALPHA_TEST, |a| a.clamp(0.0, 255.0) as u8),
+        }
+    }
+}
+
+/// A unit vector toward a sun at `azimuth` degrees from +x toward +y and
+/// `elevation` degrees above the horizon.
+fn sun_direction(azimuth: f32, elevation: f32) -> [f32; 3] {
+    let (a, e) = (azimuth.to_radians(), elevation.to_radians());
+    [e.cos() * a.cos(), e.cos() * a.sin(), e.sin()]
+}
+
+/// The occluder for one way of casting.
+fn occluder_for(
+    casting: Casting,
+    assets: &mut vale_assets::Assets,
+    adts: &[&Adt],
+    tile: &AdtFile,
+    x: u32,
+    y: u32,
+    settings: &ShadowSettings,
+) -> Box<dyn shadow::Occluder + Sync> {
+    use vale_assets::world::collision::{hulls_near, shadow_casters_near, BuildingCasts};
+    let within = Some(shadow::casting_box(x, y, settings.reach));
+    let mut casters = |buildings: BuildingCasts, cut_out: bool| {
+        let set = shadow_casters_near(adts, |p| assets.read(p).ok(), within, buildings, cut_out);
+        println!(
+            "    {}: {} triangles, {} alpha masks",
+            casting.name(),
+            set.triangles.len(),
+            set.masks.len()
+        );
+        shadow::Casters::new(set, settings.alpha)
+    };
+    match casting {
+        Casting::Default => Box::new(casters(BuildingCasts::Hull, true)),
+        Casting::Solid => Box::new(casters(BuildingCasts::Hull, false)),
+        Casting::DrawnBuildings => Box::new(casters(BuildingCasts::Drawn, true)),
+        Casting::WithGround => Box::new(WithGround(
+            casters(BuildingCasts::Hull, true),
+            shadow::Ground::of(tile),
+        )),
+        Casting::Hulls => {
+            let colliders = hulls_near(adts, |p| assets.read(p).ok(), within);
+            println!("    hulls: {} placements", colliders.len());
+            Box::new(Hulls { colliders })
+        }
+    }
+}
+
+/// The ground and a set of casters as one occluder.
+struct WithGround(shadow::Casters, shadow::Ground);
+
+impl shadow::Occluder for WithGround {
+    fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
+        self.0.blocked(from, toward, max) || self.1.blocked(from, toward, max)
+    }
+}
+
+/// Placed collision hulls as an occluder. Each ray is tested against every
+/// hull, which takes about a minute a tile.
+struct Hulls {
+    colliders: Vec<Collider>,
+}
+
+impl shadow::Occluder for Hulls {
+    fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
+        self.colliders
+            .iter()
+            .any(|c| c.ray(from, toward, max).is_some())
+    }
+}
+
+/// Every chunk's `MCSH` texels, or `None` for a chunk without one.
+fn tile_shadow(tile: &AdtFile) -> Vec<Option<Vec<u8>>> {
+    (0..tile.chunks.len())
+        .map(|i| shadow::shadow_texels(tile, i))
+        .collect()
+}
+
+fn shadowed_texels(maps: &[Option<Vec<u8>>]) -> usize {
+    maps.iter()
+        .flatten()
+        .map(|t| t.iter().filter(|&&v| v != 0).count())
+        .sum()
+}
+
+/// Rebake `raw`'s shadow once per entry of `castings`, print each score
+/// against the shipped map, and with `dump` write each comparison picture.
+#[allow(clippy::too_many_arguments)]
+fn rebake_and_score(
+    assets: &mut vale_assets::Assets,
+    adts: &[&Adt],
+    raw: &[u8],
+    map: &str,
+    x: u32,
+    y: u32,
+    castings: &[Casting],
+    dump: Option<&str>,
+) -> Result<(), String> {
+    let settings = ShadowSettings::from_env();
+    let mut tile = AdtFile::parse(raw).map_err(|e| e.to_string())?;
+    let theirs = tile_shadow(&tile);
+    println!(
+        "    shipped: {} of 256 chunks carry one, {} texels in shadow",
+        theirs.iter().filter(|t| t.is_some()).count(),
+        shadowed_texels(&theirs)
+    );
+    if let Some(dir) = dump {
+        write_shadow_png(dir, &format!("{map}_{x}_{y}_shadow_shipped.png"), &theirs, &theirs)?;
+    }
+    for &casting in castings {
+        let occluder = occluder_for(casting, assets, adts, &tile, x, y, &settings);
+        let started = std::time::Instant::now();
+        let baked = shadow::bake(&mut tile, settings.sun, occluder.as_ref(), settings.reach);
+        let mine = tile_shadow(&tile);
+        println!(
+            "    {}: {} of 256 chunks, {} texels, cast in {:.1}s",
+            casting.name(),
+            baked.shadowed,
+            shadowed_texels(&mine),
+            started.elapsed().as_secs_f32()
+        );
+        score_shadow(&theirs, &mine);
+        if let Some(dir) = dump {
+            let name = format!("{map}_{x}_{y}_shadow_{}.png", casting.name());
+            write_shadow_png(dir, &name, &theirs, &mine)?;
+        }
+    }
+    let out = tile.write();
+    match AdtFile::parse(&out).is_ok() && Adt::parse(&out).is_ok() {
+        true => println!("    the rebaked tile parses with both readers"),
+        false => println!("    ** the rebaked tile does not parse"),
+    }
+    Ok(())
+}
+
+/// How much of the shipped shadow the rebake found, and how much it added.
 fn score_shadow(theirs: &[Option<Vec<u8>>], mine: &[Option<Vec<u8>>]) {
     let (mut both, mut only_theirs, mut only_mine, mut neither) = (0usize, 0, 0, 0);
     for (t, m) in theirs.iter().zip(mine.iter()) {
@@ -810,56 +965,179 @@ fn score_shadow(theirs: &[Option<Vec<u8>>], mine: &[Option<Vec<u8>>]) {
     }
     let total = (both + only_theirs + only_mine + neither).max(1);
     println!(
-        "    agreement: {:.1}% of texels ({both} both, {only_theirs} only shipped, {only_mine} only rebaked)",
+        "      agreement: {:.1}% of texels ({both} both, {only_theirs} only shipped, {only_mine} only rebaked)",
         100.0 * (both + neither) as f32 / total as f32
     );
     if both + only_theirs > 0 {
         println!(
-            "      of the shipped shadow, {:.1}% was found again",
+            "      of the shipped shadow, {:.1}% was found",
             100.0 * both as f32 / (both + only_theirs) as f32
         );
     }
-    // **The honest caveat, printed rather than left to be discovered.** The
-    // hulls this casts from are collision hulls, and a tree's hull is its trunk:
-    // the game's own bakes were cast from the drawn geometry, canopy included.
-    // So a wooded tile is expected to come back with less shadow than it
-    // shipped with, and the number to read is not the agreement but the
-    // **asymmetry** — shadow this invents where the shipped file has none is
-    // the failure, and shadow it misses is the known gap.
-    println!(
-        "      a shipped bake casts from drawn geometry and this from collision hulls,"
-    );
-    println!(
-        "      so a wooded tile finds less. Read the invented column, not the total."
-    );
 }
 
-/// Everything on this tile that casts a shadow.
+/// `vale bake <Map> <x> <y> shadow [<dir>]`: the `MCSH` rebake alone, cast
+/// each way [`Casting`] names and scored against the shipped map.
 ///
-/// `collision::tile_hulls` does the work; what is here is the reader it is
-/// given and the [`shadow::Occluder`] it is wrapped in. The editor builds the
-/// same list through the same function from its own archive handle.
-fn build_occluder(assets: &mut vale_assets::Assets, adts: &[&Adt], x: u32, y: u32) -> Hulls {
-    // **The tile and its neighbours, cut to what can reach it** — see
-    // `collision::hulls_near` and `shadow::casting_box`.
-    let colliders = vale_assets::world::collision::hulls_near(
-        adts,
-        |path| assets.read(path).ok(),
-        Some(shadow::casting_box(x, y, shadow::REACH)),
-    );
-    println!("    {} hulls cast, from {} tiles", colliders.len(), adts.len());
-    Hulls { colliders }
-}
-
-/// The placed hulls of a neighbourhood, as something a bake can ask.
-struct Hulls {
-    colliders: Vec<Collider>,
-}
-
-impl shadow::Occluder for Hulls {
-    fn blocked(&self, from: [f32; 3], toward: [f32; 3], max: f32) -> bool {
-        self.colliders
-            .iter()
-            .any(|c| c.ray(from, toward, max).is_some())
+/// `CASTING=<name>[,<name>...]` limits the run to those ways; `SUN`, `REACH`
+/// and `ALPHA` change the settings (see [`ShadowSettings`]). With a
+/// directory, each result is written as a 1024x1024 PNG: black where both maps
+/// are shadowed, red where only the shipped map is, blue where only the rebake
+/// is, white where neither is.
+pub fn cmd_bake_shadow(cfg: &Config, map: &str, x: u32, y: u32, dump: Option<&str>) -> Result<(), String> {
+    let mut assets = crate::common::open_assets(cfg)?;
+    let path = vale_assets::adt_path(map, x, y);
+    let raw = assets.read(&path).map_err(|e| e.to_string())?;
+    let adt = Adt::parse(&raw).map_err(|e| e.to_string())?;
+    println!("{path}");
+    let neighbours = neighbours_of(&mut assets, map, x, y);
+    let everything: Vec<&Adt> = std::iter::once(&adt).chain(neighbours.iter()).collect();
+    let wanted = std::env::var("CASTING").ok();
+    let castings: Vec<Casting> = Casting::ALL
+        .into_iter()
+        .filter(|c| wanted.as_deref().is_none_or(|w| w.split(',').any(|n| n.trim() == c.name())))
+        .collect();
+    if castings.is_empty() {
+        let names: Vec<&str> = Casting::ALL.iter().map(|c| c.name()).collect();
+        return Err(format!("CASTING names none of: {}", names.join(", ")));
     }
+    rebake_and_score(&mut assets, &everything, &raw, map, x, y, &castings, dump)
+}
+
+/// A tile's shadow maps as one 1024x1024 comparison picture.
+fn write_shadow_png(
+    dir: &str,
+    name: &str,
+    theirs: &[Option<Vec<u8>>],
+    mine: &[Option<Vec<u8>>],
+) -> Result<(), String> {
+    use vale_assets::world::adt::{ALPHA_SIDE, CHUNKS_PER_SIDE};
+    let side = CHUNKS_PER_SIDE * ALPHA_SIDE;
+    let mut rgba = vec![0u8; side * side * 4];
+    for chunk in 0..CHUNKS_PER_SIDE * CHUNKS_PER_SIDE {
+        let (cx, cy) = (chunk % CHUNKS_PER_SIDE, chunk / CHUNKS_PER_SIDE);
+        for ty in 0..ALPHA_SIDE {
+            for tx in 0..ALPHA_SIDE {
+                let i = ty * ALPHA_SIDE + tx;
+                let at = |v: &[Option<Vec<u8>>]| {
+                    v.get(chunk)
+                        .and_then(|c| c.as_ref())
+                        .and_then(|c| c.get(i))
+                        .is_some_and(|&b| b != 0)
+                };
+                let colour = match (at(theirs), at(mine)) {
+                    (true, true) => [0, 0, 0],
+                    (true, false) => [220, 40, 40],
+                    (false, true) => [40, 80, 230],
+                    (false, false) => [255, 255, 255],
+                };
+                let p = ((cy * ALPHA_SIDE + ty) * side + cx * ALPHA_SIDE + tx) * 4;
+                rgba[p..p + 3].copy_from_slice(&colour);
+                rgba[p + 3] = 255;
+            }
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{dir}: {e}"))?;
+    let path = std::path::Path::new(dir).join(name);
+    let file = std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), side as u32, side as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(&rgba).map_err(|e| e.to_string())
+}
+
+/// `vale bake <Map> <x> <y> sun`: the sun direction under which the default
+/// casting best reproduces the shipped `MCSH`.
+///
+/// Casts a sample of the tile's texels, one in `STRIDE` (default 4) along each
+/// axis, under each direction of a grid, and prints the share that agree with
+/// the shipped map. The grid is azimuth `AZIMUTH` and elevation `ELEVATION`,
+/// each `<from>,<to>,<step>` in degrees, by default 40..50 and 40..54 in steps
+/// of 1. `REACH` and `ALPHA` apply as in `vale bake ... shadow`.
+pub fn cmd_bake_sun(cfg: &Config, map: &str, x: u32, y: u32) -> Result<(), String> {
+    use vale_assets::world::adt::{ALPHA_SIDE, CHUNKS_PER_SIDE, CHUNK_SIZE};
+    let mut assets = crate::common::open_assets(cfg)?;
+    let path = vale_assets::adt_path(map, x, y);
+    let raw = assets.read(&path).map_err(|e| e.to_string())?;
+    let adt = Adt::parse(&raw).map_err(|e| e.to_string())?;
+    println!("{path}");
+    let neighbours = neighbours_of(&mut assets, map, x, y);
+    let everything: Vec<&Adt> = std::iter::once(&adt).chain(neighbours.iter()).collect();
+    let tile = AdtFile::parse(&raw).map_err(|e| e.to_string())?;
+    let theirs = tile_shadow(&tile);
+    let settings = ShadowSettings::from_env();
+    let occluder = occluder_for(Casting::Default, &mut assets, &everything, &tile, x, y, &settings);
+    let stride: usize = std::env::var("STRIDE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .max(1);
+    let range = |name: &str, default: (f32, f32, f32)| -> Vec<f32> {
+        let (from, to, step) = std::env::var(name)
+            .ok()
+            .and_then(|s| {
+                let v: Vec<f32> = s.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+                (v.len() == 3 && v[2] > 0.0).then(|| (v[0], v[1], v[2]))
+            })
+            .unwrap_or(default);
+        let count = ((to - from) / step).round().max(0.0) as usize;
+        (0..=count).map(|i| from + step * i as f32).collect()
+    };
+    let azimuths = range("AZIMUTH", (40.0, 50.0, 1.0));
+    let elevations = range("ELEVATION", (40.0, 54.0, 1.0));
+
+    // The sampled texels: their ray origins and whether the shipped map
+    // shadows them.
+    let mut samples: Vec<([f32; 3], bool)> = Vec::new();
+    let texel = CHUNK_SIZE / ALPHA_SIDE as f32;
+    for (index, chunk) in tile.chunks.iter().enumerate().take(CHUNKS_PER_SIDE * CHUNKS_PER_SIDE) {
+        let origin = chunk.head().position();
+        let ground = vale_edit::adt::heights::ground(chunk);
+        for ty in (stride / 2..ALPHA_SIDE - 1).step_by(stride) {
+            for tx in (stride / 2..ALPHA_SIDE - 1).step_by(stride) {
+                let px = origin[0] - (ty as f32 + 0.5) * texel;
+                let py = origin[1] - (tx as f32 + 0.5) * texel;
+                let Some(z) = ground.height_at(px, py) else {
+                    continue;
+                };
+                let shipped = theirs[index]
+                    .as_ref()
+                    .is_some_and(|t| t[ty * ALPHA_SIDE + tx] != 0);
+                samples.push(([px, py, z + shadow::LIFT], shipped));
+            }
+        }
+    }
+    let score = |sun: [f32; 3]| -> f32 {
+        let agree = samples
+            .iter()
+            .filter(|(from, shipped)| occluder.blocked(*from, sun, settings.reach) == *shipped)
+            .count();
+        agree as f32 / samples.len().max(1) as f32
+    };
+
+    println!("  {} texels sampled", samples.len());
+    let header: String = azimuths.iter().map(|a| format!(" {a:6.2}")).collect();
+    println!("  elevation \\ azimuth{header}");
+    let mut best = (f32::MIN, 0.0, 0.0);
+    for &e in &elevations {
+        let mut line = format!("  {e:18.2}");
+        for &a in &azimuths {
+            let s = score(sun_direction(a, e));
+            line += &format!(" {s:6.4}");
+            if s > best.0 {
+                best = (s, a, e);
+            }
+        }
+        println!("{line}");
+    }
+    println!("  best: azimuth {} elevation {}, {:.4} agree", best.1, best.2, best.0);
+    let held = vale_assets::tables::light::SHADOW_SUN;
+    println!(
+        "  SHADOW_SUN: azimuth {:.2} elevation {:.2}, {:.4} agree",
+        held[1].atan2(held[0]).to_degrees(),
+        held[2].atan2(held[0].hypot(held[1])).to_degrees(),
+        score(held)
+    );
+    Ok(())
 }

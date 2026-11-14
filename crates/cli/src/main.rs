@@ -419,10 +419,19 @@ fn main() {
         // The two images an editor has to write (a tile's minimap and its
         // MCSH), scored against the ones the game shipped. `cli::bake` explains
         // why these two are the only parts of an edit that need a measurement.
-        // The `minimap` form bakes the minimap image alone over a sweep of
-        // settings. The shadow bake takes two minutes, and none of the
-        // minimap's settings can be derived from a file; they can only be
-        // measured against the shipped image.
+        // The `sun` form scores a sweep of sun directions, and the `shadow`
+        // form runs the MCSH rebake alone, cast several ways. The `minimap`
+        // form bakes the minimap image alone over a sweep of settings. The
+        // shadow bake takes two minutes, and none of the minimap's settings
+        // can be derived from a file; they can only be measured against the
+        // shipped image.
+        Some("bake") if args.len() >= 5 && args[4] == "sun" => {
+            tile(&args, |name, x, y| bake::cmd_bake_sun(&cfg, name, x, y))
+        }
+        Some("bake") if args.len() >= 5 && args[4] == "shadow" => {
+            let dump = args.get(5).map(String::as_str);
+            tile(&args, |name, x, y| bake::cmd_bake_shadow(&cfg, name, x, y, dump))
+        }
         Some("bake") if args.len() >= 5 && args[4] == "minimap" => {
             let dump = args.get(5).map(String::as_str);
             tile(&args, |name, x, y| bake::cmd_bake_minimap(&cfg, name, x, y, dump))
